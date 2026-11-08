@@ -1,5 +1,5 @@
-// Command api is the public REST API. Right now it only serves health
-// endpoints. The wallet, sms and report routes come in later steps.
+// Command api is the public REST API: wallet top-up and balance, message
+// acceptance, and health endpoints. Report routes come in a later step.
 package main
 
 import (
@@ -17,6 +17,8 @@ import (
 	"github.com/farima-sedghi/sms-gateway/internal/platform/kafka"
 	"github.com/farima-sedghi/sms-gateway/internal/platform/logging"
 	"github.com/farima-sedghi/sms-gateway/internal/platform/postgres"
+	"github.com/farima-sedghi/sms-gateway/internal/sms"
+	"github.com/farima-sedghi/sms-gateway/internal/wallet"
 )
 
 type appConfig struct {
@@ -25,6 +27,7 @@ type appConfig struct {
 	KafkaBrokers    []string
 	LogLevel        slog.Level
 	ShutdownTimeout time.Duration
+	SMSPrice        int64 // minor units per message
 }
 
 func loadConfig() (appConfig, error) {
@@ -35,8 +38,15 @@ func loadConfig() (appConfig, error) {
 		KafkaBrokers:    r.RequiredList("KAFKA_BROKERS"),
 		LogLevel:        r.LogLevel("LOG_LEVEL", slog.LevelInfo),
 		ShutdownTimeout: r.Duration("SHUTDOWN_TIMEOUT", 15*time.Second),
+		SMSPrice:        r.Int64("SMS_PRICE", 0),
 	}
-	return cfg, r.Err()
+	if err := r.Err(); err != nil {
+		return cfg, err
+	}
+	if cfg.SMSPrice <= 0 {
+		return cfg, fmt.Errorf("SMS_PRICE must be a positive integer (minor units), got %d", cfg.SMSPrice)
+	}
+	return cfg, nil
 }
 
 func main() {
@@ -72,7 +82,12 @@ func run(ctx context.Context) error {
 	}
 	defer kc.Close()
 
+	walletSvc := wallet.NewService(db)
+	smsSvc := sms.NewService(db, cfg.SMSPrice)
+
 	mux := http.NewServeMux()
+	wallet.NewHandler(walletSvc, log).Register(mux)
+	sms.NewHandler(smsSvc, log).Register(mux)
 	mux.HandleFunc("GET /healthz", httpserver.Healthz)
 	mux.Handle("GET /readyz", httpserver.Readyz(map[string]httpserver.Check{
 		"postgres": db.Ping,

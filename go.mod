@@ -3,6 +3,7 @@ module github.com/farima-sedghi/sms-gateway
 go 1.22
 
 require (
+	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.7.1
 	github.com/twmb/franz-go v1.17.1
 	github.com/twmb/franz-go/pkg/kadm v1.13.0

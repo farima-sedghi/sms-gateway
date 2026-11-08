@@ -20,12 +20,50 @@ make topics                 # describe Kafka topics
 make down                   # stop (make clean also deletes volumes)
 ```
 
+## API
+
+Amounts are integers in minor units (e.g. rials), never decimals. The price of
+one SMS is set by `SMS_PRICE`.
+
+```bash
+# Top up (creates the wallet on first use)
+curl -s -X POST localhost:8081/customers/42/topup -d '{"amount": 1000}'
+# {"customer_id":42,"balance":1000}
+
+# Balance
+curl -s localhost:8081/customers/42/balance
+
+# Send an SMS (priority: "normal" (default) or "express")
+curl -s -X POST localhost:8081/messages \
+  -H 'Idempotency-Key: order-123' \
+  -d '{"customer_id": 42, "recipient": "+989121234567", "body": "سلام", "priority": "express"}'
+# 202 {"message_id":"019a...","status":"queued","priority":"express","cost":100,"created_at":"..."}
+```
+
+| Status | When |
+|-------:|------|
+| 202 | Message accepted, charged and queued |
+| 400 | Invalid JSON, recipient, body (must fit one SMS page), priority or Idempotency-Key |
+| 402 | Balance lower than the message price |
+| 409 | Idempotency-Key already used with a different request body |
+
+### Idempotency-Key (optional, recommended)
+
+- With a key (max 255 characters, scoped per customer): retrying the same request
+  returns the original response with the header `Idempotent-Replayed: true`, and
+  you are charged only once. Reusing the key with a different body returns 409.
+- **Without a key there is no retry protection.** If a request times out and
+  you retry, the message may be **sent and charged twice**. Always send a key if
+  your client retries.
+- A request rejected with 402 does not store the key: top up and retry with the
+  same key.
+
 ## Services
 
 | Service         | Host port | What it does                                   |
 |-----------------|----------:|------------------------------------------------|
 | `api`           | 8081      | REST API (`/healthz`, `/readyz`)               |
-| `worker`        | —         | Kafka consumers -> operator                    |
+| `dispatcher`    | —         | Kafka consumers -> operator                    |
 | `outbox-relay`  | —         | Outbox table -> Kafka                          |
 | `operator-mock` | 8090      | Fake operator (configurable latency/failures)  |
 | `postgres`      | 5432      | PostgreSQL 16                                  |
@@ -37,7 +75,7 @@ make down                   # stop (make clean also deletes volumes)
 ## Layout
 
 ```
-cmd/            one main.go per binary (api, worker, outbox-relay, operator-mock)
+cmd/            one main.go per binary (api, dispatcher, outbox-relay, operator-mock)
 internal/       modules: wallet, sms, dispatch, report, ratelimit, outbox, operator
   platform/     shared setup: config, logging, postgres, kafka, httpserver
 migrations/     golang-migrate SQL files

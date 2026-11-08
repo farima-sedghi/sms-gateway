@@ -2,7 +2,6 @@ package httpserver
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"sync"
 	"time"
@@ -15,7 +14,7 @@ type Check func(ctx context.Context) error
 // not check dependencies. If it did, a Postgres outage would make the
 // orchestrator restart every API pod, and restarts don't fix Postgres.
 func Healthz(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 // Readyz is the readiness probe: can this instance do useful work right now?
@@ -54,12 +53,6 @@ func Readyz(checks map[string]Check) http.HandlerFunc {
 		if !healthy {
 			code = http.StatusServiceUnavailable
 		}
-		writeJSON(w, code, results) // encoding/json sorts map keys, so output is stable
+		WriteJSON(w, code, results) // encoding/json sorts map keys, so output is stable
 	}
-}
-
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
 }

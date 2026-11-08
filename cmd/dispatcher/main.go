@@ -1,4 +1,4 @@
-// Command worker consumes sms.express, sms.normal and sms.retry and hands
+// Command dispatcher consumes sms.express, sms.normal and sms.retry and hands
 // messages to the operator. Right now it only connects, logs and waits for
 // shutdown. Consumers come in a later step.
 package main
@@ -17,7 +17,7 @@ import (
 	"github.com/farima-sedghi/sms-gateway/internal/platform/postgres"
 )
 
-const serviceName = "worker"
+const serviceName = "dispatcher"
 
 type appConfig struct {
 	DatabaseURL  string

@@ -1,4 +1,4 @@
-# One Dockerfile for all binaries; pick one with --build-arg CMD=api|worker|outbox-relay|operator-mock.
+# One Dockerfile for all binaries; pick one with --build-arg CMD=api|dispatcher|outbox-relay|operator-mock.
 # Same idea as a .NET multi-stage build (sdk image -> aspnet runtime image).
 
 # ---- build stage: full Go toolchain ----

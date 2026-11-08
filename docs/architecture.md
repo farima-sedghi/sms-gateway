@@ -12,7 +12,7 @@ TODO: ~100M SMS/day = ~1,160 msg/s average; peak factor; express latency budget;
 "balance never negative" invariant; storage growth per day.
 
 ## 3. Components
-TODO: diagram and table of the four binaries (`api`, `worker`, `outbox-relay`,
+TODO: diagram and table of the four binaries (`api`, `dispatcher`, `outbox-relay`,
 `operator-mock`) plus Postgres and Kafka; what each scales on.
 See [ADR 0001](adr/0001-modular-monolith.md).
 
@@ -21,7 +21,7 @@ TODO: modules, owned tables, allowed dependencies, the shared-transaction except
 
 ## 5. Request flow: sending an SMS
 TODO: sequence: rate limit -> validate -> price -> tx(debit + ledger + message +
-outbox) -> 202 -> relay -> Kafka -> worker -> operator -> status.
+outbox) -> 202 -> relay -> Kafka -> dispatcher -> operator -> status.
 
 ## 6. Money: balance, ledger, idempotency
 TODO: minor units, conditional UPDATE, ledger as source of truth, Idempotency-Key,

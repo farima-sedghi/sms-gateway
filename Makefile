@@ -12,8 +12,11 @@ help: ## Show targets
 build: ## Build all binaries into ./bin
 	$(GO) build -o bin/ ./cmd/...
 
-test: ## Run unit and integration tests
-	$(GO) test -race -count=1 ./...
+# DB tests create (and drop) their own database on this server; needs `make up` first.
+TEST_DATABASE_URL ?= postgres://sms:sms@localhost:5432/sms?sslmode=disable
+
+test: ## Run unit + Postgres tests (needs the compose postgres running)
+	TEST_DATABASE_URL='$(TEST_DATABASE_URL)' $(GO) test -race -count=1 ./...
 
 lint: ## go vet + gofmt check
 	$(GO) vet ./...

@@ -78,6 +78,20 @@ func (r *Reader) Duration(key string, def time.Duration) time.Duration {
 	return d
 }
 
+// Int64 parses a base-10 integer, e.g. a price in minor units.
+func (r *Reader) Int64(key string, def int64) int64 {
+	v, ok := r.get(key)
+	if !ok {
+		return def
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		r.errs = append(r.errs, fmt.Errorf("%s: invalid integer %q", key, v))
+		return def
+	}
+	return n
+}
+
 // Float parses a float, e.g. a failure rate between 0 and 1.
 func (r *Reader) Float(key string, def float64) float64 {
 	v, ok := r.get(key)

@@ -14,7 +14,7 @@ The system must:
 - hand express messages to the operator within a guaranteed latency.
 
 Different parts of the system scale on different signals. The API scales with
-request rate. Workers scale with operator throughput and latency. The outbox relay
+request rate. Dispatchers scale with operator throughput and latency. The outbox relay
 scales with commit rate.
 
 The most important correctness rule (no negative balance, no free messages) needs
@@ -29,7 +29,7 @@ small team on a tight deadline.
 Build a **modular monolith with several binaries**:
 
 - One Go module, one Postgres database, one repository.
-- Four binaries that deploy and scale independently: `api`, `worker`,
+- Four binaries that deploy and scale independently: `api`, `dispatcher`,
   `outbox-relay` and `operator-mock` (test double).
 - Code is organised **by module first** (`wallet`, `sms`, `dispatch`, `report`,
   `ratelimit`, `outbox`, `operator`). Inside each module, layers are files
@@ -52,7 +52,7 @@ owns its SQL; `sms` only supplies the transaction.
 
 **Positive**
 - Money correctness comes from one ACID transaction, with no saga or compensation.
-- Each process scales on its own signal (`docker compose up --scale worker=N`, or
+- Each process scales on its own signal (`docker compose up --scale dispatcher=N`, or
   separate Kubernetes Deployments).
 - One build and one repo keep refactoring and code review cheap.
 - Module boundaries let a module be split into its own service later if a scaling
@@ -72,6 +72,6 @@ owns its SQL; `sms` only supplies the transaction.
 - *Microservices (wallet, sms, dispatch as separate services and databases):*
   rejected because debit + message atomicity would need a saga. Also too much
   operational overhead for the scope.
-- *Single binary doing everything:* rejected because API and workers scale on
+- *Single binary doing everything:* rejected because API and dispatchers scale on
   different signals, and a slow operator must not take request-handling CPU away
   from the API.
