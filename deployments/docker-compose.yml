@@ -1,0 +1,155 @@
+# Local stack. Run from repo root with `make up`, or here with `docker compose up -d`.
+# Every image has an explicit tag (never `latest`) so builds are reproducible.
+name: sms-gateway
+
+x-app-env: &app-env
+  DATABASE_URL: ${DATABASE_URL:-postgres://sms:sms@postgres:5432/sms?sslmode=disable}
+  KAFKA_BROKERS: kafka:9092
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+
+# App services start only when the schema is migrated and the topics exist.
+x-app-depends: &app-depends
+  migrate:
+    condition: service_completed_successfully
+  kafka-init:
+    condition: service_completed_successfully
+
+services:
+  postgres:
+    image: postgres:16.4-alpine
+    environment:
+      POSTGRES_USER: sms
+      POSTGRES_PASSWORD: sms
+      POSTGRES_DB: sms
+    ports: ["${POSTGRES_PORT:-5432}:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sms -d sms"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  kafka:
+    image: apache/kafka:3.8.0
+    environment:
+      # Single node in KRaft mode (no ZooKeeper): this one process is both broker and controller.
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # PLAINTEXT is for containers (kafka:9092); HOST is for tools on your machine (localhost:29092).
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,HOST://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Single broker, so internal topics can't have more than 1 replica.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Topics are created explicitly by kafka-init with chosen partition counts.
+      # Auto-create would silently make a 1-partition topic from a typo.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID:-5L6g3nShT-eMCtK--X86sw}
+    ports: ["${KAFKA_HOST_PORT:-29092}:29092"]
+    volumes: [kafkadata:/var/lib/kafka/data]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 20s
+
+  kafka-init:
+    image: apache/kafka:3.8.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "/scripts/create-topics.sh"]
+    volumes: [./kafka/create-topics.sh:/scripts/create-topics.sh:ro]
+    restart: "no"
+
+  kafka-ui:
+    image: kafbat/kafka-ui:v1.0.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    ports: ["${KAFKA_UI_PORT:-8080}:8080"]
+
+  migrate:
+    image: migrate/migrate:v4.17.1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes: [../migrations:/migrations:ro]
+    command:
+      - -path=/migrations
+      - -database=${DATABASE_URL:-postgres://sms:sms@postgres:5432/sms?sslmode=disable}
+      - up
+    restart: "no"
+
+  api:
+    build:
+      context: ..
+      args: { CMD: api, GOPROXY: "${GOPROXY:-https://proxy.golang.org,direct}" }
+    image: sms-gateway/api:dev
+    environment:
+      <<: *app-env
+      HTTP_ADDR: :8080
+    ports: ["${API_PORT:-8081}:8080"]
+    depends_on: *app-depends
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ..
+      args: { CMD: worker, GOPROXY: "${GOPROXY:-https://proxy.golang.org,direct}" }
+    image: sms-gateway/worker:dev
+    environment:
+      <<: *app-env
+      OPERATOR_URL: http://operator-mock:8090
+    depends_on:
+      <<: *app-depends
+      operator-mock:
+        condition: service_healthy
+    restart: unless-stopped
+
+  outbox-relay:
+    build:
+      context: ..
+      args: { CMD: outbox-relay, GOPROXY: "${GOPROXY:-https://proxy.golang.org,direct}" }
+    image: sms-gateway/outbox-relay:dev
+    environment: *app-env
+    depends_on: *app-depends
+    restart: unless-stopped
+
+  operator-mock:
+    build:
+      context: ..
+      args: { CMD: operator-mock, GOPROXY: "${GOPROXY:-https://proxy.golang.org,direct}" }
+    image: sms-gateway/operator-mock:dev
+    environment:
+      HTTP_ADDR: :8090
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      OPERATOR_LATENCY: ${OPERATOR_LATENCY:-50ms}
+      OPERATOR_FAILURE_RATE: ${OPERATOR_FAILURE_RATE:-0}
+    ports: ["${OPERATOR_PORT:-8090}:8090"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8090/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  kafkadata:

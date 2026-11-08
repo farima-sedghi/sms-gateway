@@ -1,0 +1,6 @@
+.git
+.env
+deployments
+docs
+*.md
+bin
