@@ -152,7 +152,7 @@ sequenceDiagram
     R->>P: UPDATE outbox SET published_at = now(), COMMIT
 
     K->>D: poll batch (dispatcher-express or dispatcher-normal)
-    D->>P: status → sending (guarded; 0 rows = already terminal, skip)
+    D->>P: status → sending (guarded, 0 rows = already terminal, skip)
     opt express and past expires_at
         D->>P: status → failed + refund (or unknown if uncertain), stop
     end

@@ -172,7 +172,7 @@ The tests use the **real Postgres and Kafka** from the compose stack, not mocks.
 Each test creates its own database and Kafka topics and deletes them afterwards.
 
 ```bash
-docker compose -f deployments/docker-compose.yml --env-file .env up -d postgres kafka kafka-init
+docker compose -f deployments/docker-compose.yml --env-file .env up -d postgres kafka   # or the full stack: make up
 make test
 # or without make:
 TEST_DATABASE_URL='postgres://sms:sms@localhost:5432/sms?sslmode=disable' \
