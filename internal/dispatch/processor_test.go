@@ -81,7 +81,7 @@ func newEnv(t *testing.T) *env {
 		brokers: brokers,
 		retry:   kafkatest.Topic(t, brokers, 1),
 		dlq:     kafkatest.Topic(t, brokers, 1),
-		accept:  sms.NewService(pool, price, 2*time.Minute),
+		accept:  sms.NewService(pool, price, 2*time.Minute, nil),
 		wallet:  wallet.NewService(pool),
 		life:    sms.NewLifecycle(pool),
 	}
@@ -247,7 +247,7 @@ func TestLateRetryAfterSentIsIgnored(t *testing.T) {
 
 func TestExpiredExpressIsRefundedAndNotSent(t *testing.T) {
 	e := newEnv(t)
-	e.accept = sms.NewService(e.pool, price, time.Millisecond) // express expires after 1ms
+	e.accept = sms.NewService(e.pool, price, time.Millisecond, nil) // express expires after 1ms
 	sender := &fakeSender{}
 	p := e.processor(sender)
 	ev := e.accepted(sms.PriorityExpress)
@@ -266,7 +266,7 @@ func TestExpiredExpressIsRefundedAndNotSent(t *testing.T) {
 // it ends as unknown and is NOT refunded.
 func TestExpiredWhileUncertainIsUnknownNotRefunded(t *testing.T) {
 	e := newEnv(t)
-	e.accept = sms.NewService(e.pool, price, time.Millisecond)
+	e.accept = sms.NewService(e.pool, price, time.Millisecond, nil)
 	p := e.processor(&fakeSender{})
 	ev := e.accepted(sms.PriorityExpress)
 	ev.Attempt, ev.Uncertain = 1, true

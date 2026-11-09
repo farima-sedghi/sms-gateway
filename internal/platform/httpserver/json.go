@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 )
 
 // maxBodyBytes caps request bodies. A single-page SMS request is well under
@@ -53,4 +54,15 @@ func DecodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 		return errors.New("request body must contain a single JSON object")
 	}
 	return nil
+}
+
+// PathInt64 reads the path parameter name (e.g. {id}) as a positive int64.
+// On failure it writes 400 and returns false, so handlers can just `return`.
+func PathInt64(w http.ResponseWriter, r *http.Request, name string) (int64, bool) {
+	v, err := strconv.ParseInt(r.PathValue(name), 10, 64)
+	if err != nil || v <= 0 {
+		WriteError(w, http.StatusBadRequest, name+" must be a positive integer")
+		return 0, false
+	}
+	return v, true
 }

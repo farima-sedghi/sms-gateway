@@ -4,7 +4,6 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
-	"strconv"
 
 	"github.com/farima-sedghi/sms-gateway/internal/platform/httpserver"
 )
@@ -37,7 +36,7 @@ type balanceResponse struct {
 }
 
 func (h *Handler) topUp(w http.ResponseWriter, r *http.Request) {
-	customerID, ok := parseCustomerID(w, r)
+	customerID, ok := httpserver.PathInt64(w, r, "id")
 	if !ok {
 		return
 	}
@@ -60,7 +59,7 @@ func (h *Handler) topUp(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) balance(w http.ResponseWriter, r *http.Request) {
-	customerID, ok := parseCustomerID(w, r)
+	customerID, ok := httpserver.PathInt64(w, r, "id")
 	if !ok {
 		return
 	}
@@ -71,15 +70,4 @@ func (h *Handler) balance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpserver.WriteJSON(w, http.StatusOK, balanceResponse{CustomerID: customerID, Balance: balance})
-}
-
-// parseCustomerID reads {id} from the path. On failure it writes 400 and
-// returns false, so handlers can just `return`.
-func parseCustomerID(w http.ResponseWriter, r *http.Request) (int64, bool) {
-	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	if err != nil || id <= 0 {
-		httpserver.WriteError(w, http.StatusBadRequest, "customer id must be a positive integer")
-		return 0, false
-	}
-	return id, true
 }

@@ -1,5 +1,5 @@
 // Command api is the public REST API: wallet top-up and balance, message
-// acceptance, and health endpoints. Report routes come in a later step.
+// acceptance, message reports, and health endpoints.
 package main
 
 import (
@@ -17,6 +17,8 @@ import (
 	"github.com/farima-sedghi/sms-gateway/internal/platform/kafka"
 	"github.com/farima-sedghi/sms-gateway/internal/platform/logging"
 	"github.com/farima-sedghi/sms-gateway/internal/platform/postgres"
+	"github.com/farima-sedghi/sms-gateway/internal/ratelimit"
+	"github.com/farima-sedghi/sms-gateway/internal/report"
 	"github.com/farima-sedghi/sms-gateway/internal/sms"
 	"github.com/farima-sedghi/sms-gateway/internal/wallet"
 )
@@ -29,6 +31,13 @@ type appConfig struct {
 	ShutdownTimeout time.Duration
 	SMSPrice        int64         // minor units per message
 	ExpressTTL      time.Duration // express must reach the operator within this
+
+	// Rate limits are GLOBAL per customer; each instance enforces
+	// global / APIInstances (see docs/adr/0007).
+	RateNormal   ratelimit.Limit
+	RateExpress  ratelimit.Limit
+	APIInstances int
+	RateIdleTTL  time.Duration
 }
 
 func loadConfig() (appConfig, error) {
@@ -41,6 +50,10 @@ func loadConfig() (appConfig, error) {
 		ShutdownTimeout: r.Duration("SHUTDOWN_TIMEOUT", 15*time.Second),
 		SMSPrice:        r.Int64("SMS_PRICE", 0),
 		ExpressTTL:      r.Duration("EXPRESS_TTL", 2*time.Minute),
+		RateNormal:      ratelimit.Limit{Rate: r.Float("RATE_LIMIT_NORMAL_RPS", 200), Burst: r.Int("RATE_LIMIT_NORMAL_BURST", 400)},
+		RateExpress:     ratelimit.Limit{Rate: r.Float("RATE_LIMIT_EXPRESS_RPS", 50), Burst: r.Int("RATE_LIMIT_EXPRESS_BURST", 100)},
+		APIInstances:    r.Int("API_INSTANCES", 1),
+		RateIdleTTL:     r.Duration("RATE_LIMIT_IDLE_TTL", 10*time.Minute),
 	}
 	if err := r.Err(); err != nil {
 		return cfg, err
@@ -50,6 +63,14 @@ func loadConfig() (appConfig, error) {
 	}
 	if cfg.ExpressTTL <= 0 {
 		return cfg, fmt.Errorf("EXPRESS_TTL must be positive, got %s", cfg.ExpressTTL)
+	}
+	if cfg.APIInstances <= 0 {
+		return cfg, fmt.Errorf("API_INSTANCES must be positive, got %d", cfg.APIInstances)
+	}
+	for name, l := range map[string]ratelimit.Limit{"NORMAL": cfg.RateNormal, "EXPRESS": cfg.RateExpress} {
+		if l.Rate <= 0 || l.Burst <= 0 {
+			return cfg, fmt.Errorf("RATE_LIMIT_%s_RPS and RATE_LIMIT_%s_BURST must be positive", name, name)
+		}
 	}
 	return cfg, nil
 }
@@ -87,12 +108,28 @@ func run(ctx context.Context) error {
 	}
 	defer kc.Close()
 
+	// Per-instance share of the global per-customer limits. The burst is
+	// divided too, but never below 1, or nobody could ever send.
+	perInstance := func(l ratelimit.Limit) ratelimit.Limit {
+		n := cfg.APIInstances
+		return ratelimit.Limit{Rate: l.Rate / float64(n), Burst: max(l.Burst/n, 1)}
+	}
+	limiter := ratelimit.NewMemory(ratelimit.Config{
+		Classes: map[string]ratelimit.Limit{
+			string(sms.PriorityNormal):  perInstance(cfg.RateNormal),
+			string(sms.PriorityExpress): perInstance(cfg.RateExpress),
+		},
+		IdleTTL: cfg.RateIdleTTL,
+	}, log)
+	go limiter.Run(ctx, time.Minute) // evicts idle buckets; stops on shutdown
+
 	walletSvc := wallet.NewService(db)
-	smsSvc := sms.NewService(db, cfg.SMSPrice, cfg.ExpressTTL)
+	smsSvc := sms.NewService(db, cfg.SMSPrice, cfg.ExpressTTL, limiter)
 
 	mux := http.NewServeMux()
 	wallet.NewHandler(walletSvc, log).Register(mux)
 	sms.NewHandler(smsSvc, log).Register(mux)
+	report.NewHandler(report.NewService(db), log).Register(mux)
 	mux.HandleFunc("GET /healthz", httpserver.Healthz)
 	mux.Handle("GET /readyz", httpserver.Readyz(map[string]httpserver.Check{
 		"postgres": db.Ping,

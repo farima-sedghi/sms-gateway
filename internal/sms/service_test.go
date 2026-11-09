@@ -4,6 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -12,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/farima-sedghi/sms-gateway/internal/platform/postgres/pgtest"
+	"github.com/farima-sedghi/sms-gateway/internal/ratelimit"
 	"github.com/farima-sedghi/sms-gateway/internal/sms"
 	"github.com/farima-sedghi/sms-gateway/internal/wallet"
 )
@@ -30,7 +36,7 @@ func newEnv(t *testing.T) env {
 	pool := pgtest.New(t)
 	return env{
 		pool:   pool,
-		sms:    sms.NewService(pool, price, 2*time.Minute),
+		sms:    sms.NewService(pool, price, 2*time.Minute, nil),
 		life:   sms.NewLifecycle(pool),
 		wallet: wallet.NewService(pool),
 	}
@@ -392,5 +398,79 @@ func TestSendingReentryAndUnknownIsTerminal(t *testing.T) {
 	}
 	if b := e.balance(t, 1); b != 1000-price {
 		t.Errorf("balance = %d, want %d (no refund)", b, 1000-price)
+	}
+}
+
+// denyAll is a limiter that always says "wait 1.5s".
+type denyAll struct{}
+
+func (denyAll) Allow(int64, string) (bool, time.Duration) { return false, 1500 * time.Millisecond }
+
+// A rate-limited request is rejected before the transaction: no charge,
+// no message, no outbox row, no idempotency key.
+func TestRateLimitedAcceptWritesNothing(t *testing.T) {
+	e := newEnv(t)
+	e.sms = sms.NewService(e.pool, price, 2*time.Minute, denyAll{})
+	e.topUp(t, 1, 1000)
+
+	_, err := e.sms.Accept(context.Background(), 1, hello, "key-1")
+	var rl *sms.RateLimitError
+	if !errors.Is(err, sms.ErrRateLimited) || !errors.As(err, &rl) || rl.RetryAfter != 1500*time.Millisecond {
+		t.Fatalf("error = %v, want *RateLimitError{1.5s}", err)
+	}
+	if b := e.balance(t, 1); b != 1000 {
+		t.Errorf("balance = %d, want 1000 (no charge)", b)
+	}
+	for _, table := range []string{"messages", "outbox", "idempotency_keys"} {
+		if n := e.count(t, table); n != 0 {
+			t.Errorf("%s rows = %d, want 0", table, n)
+		}
+	}
+}
+
+// Through the real handler and the real in-memory limiter (burst 1):
+// the second request in a row gets 429 with Retry-After, and is not charged.
+func TestHTTP429WithRetryAfter(t *testing.T) {
+	e := newEnv(t)
+	e.topUp(t, 1, 1000)
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	limiter := ratelimit.NewMemory(ratelimit.Config{
+		Classes: map[string]ratelimit.Limit{"normal": {Rate: 0.5, Burst: 1}}, // 1 token per 2s
+	}, log)
+	mux := http.NewServeMux()
+	sms.NewHandler(sms.NewService(e.pool, price, 2*time.Minute, limiter), log).Register(mux)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	post := func() *http.Response {
+		resp, err := http.Post(srv.URL+"/messages", "application/json",
+			strings.NewReader(`{"customer_id":1,"recipient":"989121234567","body":"hi"}`))
+		pgtest.Must(t, err)
+		resp.Body.Close()
+		return resp
+	}
+
+	if r := post(); r.StatusCode != http.StatusAccepted {
+		t.Fatalf("first request: %d, want 202", r.StatusCode)
+	}
+	r := post()
+	if r.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("second request: %d, want 429", r.StatusCode)
+	}
+	if ra := r.Header.Get("Retry-After"); ra != "2" {
+		t.Errorf("Retry-After = %q, want \"2\" (seconds until the next token, rounded up)", ra)
+	}
+	if b := e.balance(t, 1); b != 1000-price {
+		t.Errorf("balance = %d, want %d (only the 202 is charged)", b, 1000-price)
+	}
+
+	// Another customer has its own bucket.
+	e.topUp(t, 2, 1000)
+	resp, err := http.Post(srv.URL+"/messages", "application/json",
+		strings.NewReader(`{"customer_id":2,"recipient":"989121234567","body":"hi"}`))
+	pgtest.Must(t, err)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Errorf("customer 2: %d, want 202", resp.StatusCode)
 	}
 }

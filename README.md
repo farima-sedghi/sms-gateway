@@ -46,6 +46,7 @@ curl -s -X POST localhost:8081/messages \
 | 400 | Invalid JSON, recipient, body (must fit one SMS page), priority or Idempotency-Key |
 | 402 | Balance lower than the message price |
 | 409 | Idempotency-Key already used with a different request body |
+| 429 | Sending faster than your rate limit; retry after the `Retry-After` seconds. Nothing is charged |
 
 ### Idempotency-Key (optional, recommended)
 
@@ -57,6 +58,35 @@ curl -s -X POST localhost:8081/messages \
   your client retries.
 - A request rejected with 402 does not store the key: top up and retry with the
   same key.
+
+### Rate limits
+
+Each customer has a token bucket per priority: by default 200 msg/s (burst
+400) for normal and 50 msg/s (burst 100) for express. The limits are separate,
+so heavy normal traffic never uses up your express allowance. Over the limit
+you get `429` with `Retry-After`, and the request is not charged.
+
+### Reports
+
+```bash
+# Your messages in a time range (from inclusive, to exclusive, at most 31 days), newest first
+curl -s 'localhost:8081/customers/42/messages?from=2026-11-01T00:00:00Z&to=2026-11-10T00:00:00Z&limit=50'
+# {"messages":[{"message_id":"...","recipient":"...","priority":"normal","status":"sent",
+#   "cost":100,"attempts":1,"created_at":"...","handed_at":"...","last_error":null}, ...],
+#  "next_cursor":"eyJ0Ijoi..."}
+
+# Next page: pass next_cursor back unchanged, with the same from/to/status
+curl -s 'localhost:8081/customers/42/messages?from=...&to=...&limit=50&cursor=eyJ0Ijoi...'
+
+# Only failed messages
+curl -s 'localhost:8081/customers/42/messages?from=...&to=...&status=failed'
+
+# One message
+curl -s localhost:8081/customers/42/messages/019a...
+```
+
+`next_cursor` is `null` on the last page. `status` can be `queued`, `sending`,
+`retrying`, `sent`, `failed` or `unknown`. `limit` is 1-100 (default 50).
 
 ### What happens after 202
 

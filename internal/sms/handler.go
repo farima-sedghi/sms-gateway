@@ -4,6 +4,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -64,6 +65,14 @@ func (h *Handler) send(w http.ResponseWriter, r *http.Request) {
 		httpserver.WriteError(w, http.StatusPaymentRequired, err.Error())
 	case errors.Is(err, ErrIdempotencyConflict):
 		httpserver.WriteError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, ErrRateLimited):
+		var rl *RateLimitError
+		retryAfter := time.Second
+		if errors.As(err, &rl) {
+			retryAfter = rl.RetryAfter
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(retryAfter)))
+		httpserver.WriteError(w, http.StatusTooManyRequests, err.Error())
 	case err != nil:
 		h.log.ErrorContext(r.Context(), "accept message failed", "customer_id", req.CustomerID, "err", err)
 		httpserver.WriteError(w, http.StatusInternalServerError, "internal error")
@@ -83,4 +92,11 @@ func (h *Handler) send(w http.ResponseWriter, r *http.Request) {
 			CreatedAt: m.CreatedAt,
 		})
 	}
+}
+
+// retryAfterSeconds rounds up to whole seconds (the Retry-After unit), at
+// least 1, so a client never retries before a token is available.
+func retryAfterSeconds(d time.Duration) int {
+	secs := int((d + time.Second - 1) / time.Second)
+	return max(secs, 1)
 }

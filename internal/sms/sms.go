@@ -20,7 +20,22 @@ var (
 	// ErrIdempotencyConflict: the Idempotency-Key was already used with a
 	// different request body (409).
 	ErrIdempotencyConflict = errors.New("idempotency key reused with a different request")
+	// ErrRateLimited: the customer sends faster than its limit (429). The
+	// concrete error is *RateLimitError, which carries the wait time.
+	ErrRateLimited = errors.New("rate limit exceeded")
 )
+
+// RateLimitError says how long to wait before retrying (the Retry-After header).
+type RateLimitError struct {
+	RetryAfter time.Duration
+}
+
+func (e *RateLimitError) Error() string {
+	return fmt.Sprintf("%s: retry after %s", ErrRateLimited, e.RetryAfter)
+}
+
+// Is makes errors.Is(err, ErrRateLimited) true for a *RateLimitError.
+func (e *RateLimitError) Is(target error) bool { return target == ErrRateLimited }
 
 // Priority decides the topic and worker pool a message goes through.
 type Priority string
