@@ -47,11 +47,17 @@ func TopicFor(p Priority) string {
 // Status is the message lifecycle state:
 //
 //	queued -> sending -> sent
-//	   |         |
-//	   |         +----> retrying -> sending ...
-//	   +--------------> failed (also from sending / retrying)
+//	             |  ^
+//	             v  |
+//	          retrying
 //
-// sent and failed are terminal.
+//	failed  <- queued | sending | retrying   (certain non-delivery: refunded)
+//	unknown <- sending | retrying            (maybe delivered: never refunded)
+//
+// sending may be re-entered from sending: a redelivered Kafka record (e.g.
+// after a dispatcher crash) must be able to finish the job; the operator
+// dedupes by message id, so this never sends twice.
+// sent, failed and unknown are terminal.
 type Status string
 
 const (
@@ -60,22 +66,28 @@ const (
 	StatusRetrying Status = "retrying"
 	StatusSent     Status = "sent"
 	StatusFailed   Status = "failed"
+	// StatusUnknown: the operator may or may not have delivered the message
+	// (e.g. every attempt timed out). Terminal, not refunded, needs manual
+	// reconciliation with the operator.
+	StatusUnknown Status = "unknown"
 )
 
 // allowedFrom is the allow-list of source states for each target state.
 // Every status UPDATE uses it in its WHERE clause, so a duplicate or late
 // event (e.g. "fail" for a message that is already sent) matches 0 rows and
-// changes nothing. Terminal states (sent, failed) appear in no list.
+// changes nothing. Terminal states (sent, failed, unknown) appear in no list.
 func allowedFrom(to Status) []Status {
 	switch to {
 	case StatusSending:
-		return []Status{StatusQueued, StatusRetrying}
+		return []Status{StatusQueued, StatusRetrying, StatusSending}
 	case StatusRetrying:
 		return []Status{StatusSending}
 	case StatusSent:
 		return []Status{StatusSending}
 	case StatusFailed:
 		return []Status{StatusQueued, StatusSending, StatusRetrying}
+	case StatusUnknown:
+		return []Status{StatusSending, StatusRetrying}
 	default:
 		return nil
 	}
@@ -156,6 +168,7 @@ type Message struct {
 	Status     Status
 	Cost       int64
 	CreatedAt  time.Time
+	ExpiresAt  *time.Time // express only
 }
 
 // validRecipient accepts an optional leading + and 8-15 digits (E.164 length).

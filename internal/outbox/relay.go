@@ -14,6 +14,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/twmb/franz-go/pkg/kgo"
+
+	platformbackoff "github.com/farima-sedghi/sms-gateway/internal/platform/backoff"
 )
 
 // HeaderOutboxID is the Kafka header carrying the outbox row id, for tracing
@@ -308,20 +310,10 @@ func (r *Relay) Lag(ctx context.Context, topic string) (time.Duration, error) {
 }
 
 // backoff returns the wait before retry number attempt (1, 2, 3, ...):
-// exponential from 100ms, capped at 5s, with "equal jitter" (between half and
-// all of the step) so replicas that failed together don't retry in lockstep.
-// jitter must be in [0, 1). Pure function, so it is easy to test.
+// exponential from 100ms, capped at 5s, with equal jitter so replicas that
+// failed together don't retry in lockstep. jitter must be in [0, 1).
 func backoff(attempt int, jitter float64) time.Duration {
-	const (
-		base    = 100 * time.Millisecond
-		maxWait = 5 * time.Second
-	)
-	d := maxWait
-	if attempt < 7 { // 100ms << 6 = 6.4s, already past the cap
-		d = min(base<<(attempt-1), maxWait)
-	}
-	half := d / 2
-	return half + time.Duration(jitter*float64(half))
+	return platformbackoff.EqualJitter(platformbackoff.Exponential(attempt, 100*time.Millisecond, 5*time.Second), jitter)
 }
 
 // sleep waits for d or until ctx is cancelled, whichever comes first.

@@ -54,32 +54,44 @@ func selectIdempotencyKey(ctx context.Context, tx pgx.Tx, customerID int64, key 
 	return k, nil
 }
 
-// insertMessage stores a new message. createdAt == nil means "use now()".
+// insertMessage stores a new message and returns its created_at and
+// expires_at. createdAt == nil means "use now()".
 // With an idempotency key, createdAt is the key row's created_at, so a replay
 // can find the message by its full primary key (id, created_at) and Postgres
 // only looks in that one day's partition.
-func insertMessage(ctx context.Context, tx pgx.Tx, m Message, createdAt *time.Time) (time.Time, error) {
-	var stored time.Time
-	err := tx.QueryRow(ctx, `
-		INSERT INTO messages (id, customer_id, recipient, body, priority, status, cost, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8::timestamptz, now()))
-		RETURNING created_at`,
-		m.ID, m.CustomerID, m.Recipient, m.Body, string(m.Priority), string(m.Status), m.Cost, createdAt,
-	).Scan(&stored)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("insert message: %w", err)
+// ttl != nil (express) sets expires_at = created_at + ttl, computed in SQL so
+// both timestamps come from the same clock.
+func insertMessage(ctx context.Context, tx pgx.Tx, m Message, createdAt *time.Time, ttl *time.Duration) (time.Time, *time.Time, error) {
+	var ttlSeconds *float64
+	if ttl != nil {
+		secs := ttl.Seconds()
+		ttlSeconds = &secs
 	}
-	return stored, nil
+	var stored time.Time
+	var expiresAt *time.Time
+	err := tx.QueryRow(ctx, `
+		WITH t AS (SELECT COALESCE($8::timestamptz, now()) AS created_at)
+		INSERT INTO messages (id, customer_id, recipient, body, priority, status, cost, created_at, expires_at)
+		SELECT $1::uuid, $2::bigint, $3::text, $4::text, $5::text, $6::text, $7::bigint, t.created_at,
+		       t.created_at + make_interval(secs => $9::float8)  -- NULL when $9 is NULL
+		FROM t
+		RETURNING created_at, expires_at`,
+		m.ID, m.CustomerID, m.Recipient, m.Body, string(m.Priority), string(m.Status), m.Cost, createdAt, ttlSeconds,
+	).Scan(&stored, &expiresAt)
+	if err != nil {
+		return time.Time{}, nil, fmt.Errorf("insert message: %w", err)
+	}
+	return stored, expiresAt, nil
 }
 
 func selectMessage(ctx context.Context, tx pgx.Tx, id uuid.UUID, createdAt time.Time) (Message, error) {
 	var m Message
 	var priority, status string
 	err := tx.QueryRow(ctx, `
-		SELECT id, customer_id, recipient, body, priority, status, cost, created_at
+		SELECT id, customer_id, recipient, body, priority, status, cost, created_at, expires_at
 		FROM messages WHERE id = $1 AND created_at = $2`,
 		id, createdAt,
-	).Scan(&m.ID, &m.CustomerID, &m.Recipient, &m.Body, &priority, &status, &m.Cost, &m.CreatedAt)
+	).Scan(&m.ID, &m.CustomerID, &m.Recipient, &m.Body, &priority, &status, &m.Cost, &m.CreatedAt, &m.ExpiresAt)
 	if err != nil {
 		return Message{}, fmt.Errorf("select message %s: %w", id, err)
 	}
@@ -87,27 +99,53 @@ func selectMessage(ctx context.Context, tx pgx.Tx, id uuid.UUID, createdAt time.
 	return m, nil
 }
 
-// transition moves a message to status `to`, but only from one of the
-// allowed source states. changed=false means the message was not in an
-// allowed state (duplicate or late event) and nothing was written.
-func transition(ctx context.Context, tx pgx.Tx, id uuid.UUID, createdAt time.Time, to Status) (changed bool, customerID, cost int64, err error) {
-	from := allowedFrom(to)
+// change describes one status transition plus the columns it also sets.
+type change struct {
+	to            Status
+	countAttempt  bool    // attempts = attempts + 1 (entering sending)
+	lastError     *string // nil = keep
+	operatorMsgID *string // nil = keep
+	setHandedAt   bool    // handed_at = now() (entering sent)
+}
+
+// transitioned is what a successful transition returns.
+type transitioned struct {
+	customerID int64
+	cost       int64
+	handedAt   *time.Time
+}
+
+// transition moves a message to c.to, but only from one of the allowed
+// source states (allowedFrom). changed=false means the message was not in
+// an allowed state (duplicate or late event) and nothing was written.
+func transition(ctx context.Context, tx pgx.Tx, id uuid.UUID, createdAt time.Time, c change) (changed bool, res transitioned, err error) {
+	from := allowedFrom(c.to)
 	fromStrings := make([]string, len(from))
 	for i, s := range from {
 		fromStrings[i] = string(s)
 	}
+	attemptDelta := 0
+	if c.countAttempt {
+		attemptDelta = 1
+	}
 
 	err = tx.QueryRow(ctx, `
-		UPDATE messages SET status = $3, updated_at = now()
+		UPDATE messages SET
+		  status          = $3,
+		  updated_at      = now(),
+		  attempts        = attempts + $5,
+		  last_error      = COALESCE($6, last_error),
+		  operator_msg_id = COALESCE($7, operator_msg_id),
+		  handed_at       = CASE WHEN $8 THEN now() ELSE handed_at END
 		WHERE id = $1 AND created_at = $2 AND status = ANY($4)
-		RETURNING customer_id, cost`,
-		id, createdAt, string(to), fromStrings,
-	).Scan(&customerID, &cost)
+		RETURNING customer_id, cost, handed_at`,
+		id, createdAt, string(c.to), fromStrings, attemptDelta, c.lastError, c.operatorMsgID, c.setHandedAt,
+	).Scan(&res.customerID, &res.cost, &res.handedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, 0, 0, nil
+		return false, transitioned{}, nil
 	}
 	if err != nil {
-		return false, 0, 0, fmt.Errorf("transition message %s to %s: %w", id, to, err)
+		return false, transitioned{}, fmt.Errorf("transition message %s to %s: %w", id, c.to, err)
 	}
-	return true, customerID, cost, nil
+	return true, res, nil
 }

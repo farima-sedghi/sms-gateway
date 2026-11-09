@@ -27,7 +27,8 @@ type appConfig struct {
 	KafkaBrokers    []string
 	LogLevel        slog.Level
 	ShutdownTimeout time.Duration
-	SMSPrice        int64 // minor units per message
+	SMSPrice        int64         // minor units per message
+	ExpressTTL      time.Duration // express must reach the operator within this
 }
 
 func loadConfig() (appConfig, error) {
@@ -39,12 +40,16 @@ func loadConfig() (appConfig, error) {
 		LogLevel:        r.LogLevel("LOG_LEVEL", slog.LevelInfo),
 		ShutdownTimeout: r.Duration("SHUTDOWN_TIMEOUT", 15*time.Second),
 		SMSPrice:        r.Int64("SMS_PRICE", 0),
+		ExpressTTL:      r.Duration("EXPRESS_TTL", 2*time.Minute),
 	}
 	if err := r.Err(); err != nil {
 		return cfg, err
 	}
 	if cfg.SMSPrice <= 0 {
 		return cfg, fmt.Errorf("SMS_PRICE must be a positive integer (minor units), got %d", cfg.SMSPrice)
+	}
+	if cfg.ExpressTTL <= 0 {
+		return cfg, fmt.Errorf("EXPRESS_TTL must be positive, got %s", cfg.ExpressTTL)
 	}
 	return cfg, nil
 }
@@ -83,7 +88,7 @@ func run(ctx context.Context) error {
 	defer kc.Close()
 
 	walletSvc := wallet.NewService(db)
-	smsSvc := sms.NewService(db, cfg.SMSPrice)
+	smsSvc := sms.NewService(db, cfg.SMSPrice, cfg.ExpressTTL)
 
 	mux := http.NewServeMux()
 	wallet.NewHandler(walletSvc, log).Register(mux)

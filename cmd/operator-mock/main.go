@@ -1,7 +1,6 @@
-// Command operator-mock is a fake SMS operator for local runs and load tests.
-// Right now it only serves /healthz. The send endpoint with configurable
-// latency and failure rate comes in a later step. Its env vars are already
-// read, so the compose file won't need to change.
+// Command operator-mock is a fake SMS operator for local runs and load
+// tests: POST /send dedupes by ref and fails on demand (temporary,
+// permanent, timeout); GET /stats returns how many messages it "sent".
 package main
 
 import (
@@ -14,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/farima-sedghi/sms-gateway/internal/operator/operatormock"
 	"github.com/farima-sedghi/sms-gateway/internal/platform/config"
 	"github.com/farima-sedghi/sms-gateway/internal/platform/httpserver"
 	"github.com/farima-sedghi/sms-gateway/internal/platform/logging"
@@ -21,8 +21,7 @@ import (
 
 type appConfig struct {
 	HTTPAddr        string
-	Latency         time.Duration
-	FailureRate     float64
+	Mock            operatormock.Config
 	LogLevel        slog.Level
 	ShutdownTimeout time.Duration
 }
@@ -30,17 +29,32 @@ type appConfig struct {
 func loadConfig() (appConfig, error) {
 	r := config.NewReader(os.LookupEnv)
 	cfg := appConfig{
-		HTTPAddr:        r.String("HTTP_ADDR", ":8090"),
-		Latency:         r.Duration("OPERATOR_LATENCY", 50*time.Millisecond),
-		FailureRate:     r.Float("OPERATOR_FAILURE_RATE", 0),
+		HTTPAddr: r.String("HTTP_ADDR", ":8090"),
+		Mock: operatormock.Config{
+			Latency:         r.Duration("OPERATOR_LATENCY", 50*time.Millisecond),
+			TempFailureRate: r.Float("OPERATOR_TEMP_FAILURE_RATE", 0),
+			PermFailureRate: r.Float("OPERATOR_PERM_FAILURE_RATE", 0),
+			TimeoutRate:     r.Float("OPERATOR_TIMEOUT_RATE", 0),
+			TimeoutDelay:    r.Duration("OPERATOR_TIMEOUT_DELAY", 30*time.Second),
+		},
 		LogLevel:        r.LogLevel("LOG_LEVEL", slog.LevelInfo),
 		ShutdownTimeout: r.Duration("SHUTDOWN_TIMEOUT", 5*time.Second),
 	}
 	if err := r.Err(); err != nil {
 		return cfg, err
 	}
-	if cfg.FailureRate < 0 || cfg.FailureRate > 1 {
-		return cfg, fmt.Errorf("OPERATOR_FAILURE_RATE must be between 0 and 1, got %v", cfg.FailureRate)
+	m := cfg.Mock
+	for name, v := range map[string]float64{
+		"OPERATOR_TEMP_FAILURE_RATE": m.TempFailureRate,
+		"OPERATOR_PERM_FAILURE_RATE": m.PermFailureRate,
+		"OPERATOR_TIMEOUT_RATE":      m.TimeoutRate,
+	} {
+		if v < 0 || v > 1 {
+			return cfg, fmt.Errorf("%s must be between 0 and 1, got %v", name, v)
+		}
+	}
+	if sum := m.TempFailureRate + m.PermFailureRate + m.TimeoutRate; sum > 1 {
+		return cfg, fmt.Errorf("failure rates add up to %v; they must add up to at most 1", sum)
 	}
 	return cfg, nil
 }
@@ -65,8 +79,11 @@ func run(ctx context.Context) error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", httpserver.Healthz)
+	operatormock.New(cfg.Mock, log).Register(mux)
 	handler := httpserver.Chain(mux, httpserver.RequestID, httpserver.Recover(log), httpserver.AccessLog(log))
 
-	log.Info("operator-mock started", "latency", cfg.Latency, "failure_rate", cfg.FailureRate)
+	m := cfg.Mock
+	log.Info("operator-mock started", "latency", m.Latency, "temp_failure_rate", m.TempFailureRate,
+		"perm_failure_rate", m.PermFailureRate, "timeout_rate", m.TimeoutRate, "timeout_delay", m.TimeoutDelay)
 	return httpserver.Run(ctx, cfg.HTTPAddr, handler, log, cfg.ShutdownTimeout)
 }

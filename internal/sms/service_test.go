@@ -21,13 +21,19 @@ const price = 100
 type env struct {
 	pool   *pgxpool.Pool
 	sms    *sms.Service
+	life   *sms.Lifecycle
 	wallet *wallet.Service
 }
 
 func newEnv(t *testing.T) env {
 	t.Helper()
 	pool := pgtest.New(t)
-	return env{pool: pool, sms: sms.NewService(pool, price), wallet: wallet.NewService(pool)}
+	return env{
+		pool:   pool,
+		sms:    sms.NewService(pool, price, 2*time.Minute),
+		life:   sms.NewLifecycle(pool),
+		wallet: wallet.NewService(pool),
+	}
 }
 
 func (e env) topUp(t *testing.T, customerID, amount int64) {
@@ -252,12 +258,12 @@ func TestFailAndRefundTwiceRefundsOnce(t *testing.T) {
 	pgtest.Must(t, err)
 	m := res.Message
 
-	refunded, err := e.sms.FailAndRefund(ctx, m.ID, m.CreatedAt)
+	refunded, err := e.life.FailAndRefund(ctx, m.ID, m.CreatedAt, "test failure")
 	pgtest.Must(t, err)
 	if !refunded {
 		t.Fatal("first FailAndRefund did not refund")
 	}
-	refunded, err = e.sms.FailAndRefund(ctx, m.ID, m.CreatedAt)
+	refunded, err = e.life.FailAndRefund(ctx, m.ID, m.CreatedAt, "test failure")
 	pgtest.Must(t, err)
 	if refunded {
 		t.Error("second FailAndRefund refunded again")
@@ -284,15 +290,18 @@ func TestLateFailAfterSentIsIgnored(t *testing.T) {
 	pgtest.Must(t, err)
 	m := res.Message
 
-	for _, step := range []func(context.Context, uuid.UUID, time.Time) (bool, error){e.sms.MarkSending, e.sms.MarkSent} {
-		changed, err := step(ctx, m.ID, m.CreatedAt)
-		pgtest.Must(t, err)
-		if !changed {
-			t.Fatal("setup transition did not apply")
-		}
+	changed, err := e.life.MarkSending(ctx, m.ID, m.CreatedAt)
+	pgtest.Must(t, err)
+	if !changed {
+		t.Fatal("queued -> sending did not apply")
+	}
+	changed, _, err = e.life.MarkSent(ctx, m.ID, m.CreatedAt, "op-1")
+	pgtest.Must(t, err)
+	if !changed {
+		t.Fatal("sending -> sent did not apply")
 	}
 
-	refunded, err := e.sms.FailAndRefund(ctx, m.ID, m.CreatedAt)
+	refunded, err := e.life.FailAndRefund(ctx, m.ID, m.CreatedAt, "test failure")
 	pgtest.Must(t, err)
 	if refunded {
 		t.Error("a sent message was refunded")
@@ -313,16 +322,75 @@ func TestTerminalStatesCannotBeLeft(t *testing.T) {
 	pgtest.Must(t, err)
 	m := res.Message
 
-	_, err = e.sms.FailAndRefund(ctx, m.ID, m.CreatedAt)
+	_, err = e.life.FailAndRefund(ctx, m.ID, m.CreatedAt, "test failure")
 	pgtest.Must(t, err)
 
-	if changed, _ := e.sms.MarkSending(ctx, m.ID, m.CreatedAt); changed {
+	if changed, _ := e.life.MarkSending(ctx, m.ID, m.CreatedAt); changed {
 		t.Error("failed -> sending was allowed")
 	}
-	if changed, _ := e.sms.MarkSent(ctx, m.ID, m.CreatedAt); changed {
+	if changed, _, _ := e.life.MarkSent(ctx, m.ID, m.CreatedAt, "op-1"); changed {
 		t.Error("failed -> sent was allowed")
 	}
 	if s := e.status(t, m.ID); s != sms.StatusFailed {
 		t.Errorf("status = %q, want failed", s)
+	}
+}
+
+func TestExpressGetsExpiryNormalDoesNot(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	e.topUp(t, 1, 1000)
+
+	express := hello
+	express.Priority = sms.PriorityExpress
+	ex, err := e.sms.Accept(ctx, 1, express, "")
+	pgtest.Must(t, err)
+	if ex.Message.ExpiresAt == nil || ex.Message.ExpiresAt.Sub(ex.Message.CreatedAt) != 2*time.Minute {
+		t.Errorf("express expires_at = %v, want created_at + 2m (%v)", ex.Message.ExpiresAt, ex.Message.CreatedAt)
+	}
+	n, err := e.sms.Accept(ctx, 1, hello, "")
+	pgtest.Must(t, err)
+	if n.Message.ExpiresAt != nil {
+		t.Errorf("normal expires_at = %v, want nil", n.Message.ExpiresAt)
+	}
+}
+
+// Re-entry: a redelivered record may move sending -> sending again; unknown
+// is terminal and never refunded.
+func TestSendingReentryAndUnknownIsTerminal(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	e.topUp(t, 1, 1000)
+	res, err := e.sms.Accept(ctx, 1, hello, "")
+	pgtest.Must(t, err)
+	m := res.Message
+
+	for i := 0; i < 2; i++ {
+		changed, err := e.life.MarkSending(ctx, m.ID, m.CreatedAt)
+		pgtest.Must(t, err)
+		if !changed {
+			t.Fatalf("MarkSending #%d did not apply", i+1)
+		}
+	}
+	if n := pgtest.QueryInt(t, e.pool, `SELECT attempts FROM messages WHERE id = $1`, m.ID); n != 2 {
+		t.Errorf("attempts = %d, want 2", n)
+	}
+
+	changed, err := e.life.MarkUnknown(ctx, m.ID, m.CreatedAt, "timeout")
+	pgtest.Must(t, err)
+	if !changed {
+		t.Fatal("sending -> unknown did not apply")
+	}
+	if refunded, _ := e.life.FailAndRefund(ctx, m.ID, m.CreatedAt, "late"); refunded {
+		t.Error("unknown message was refunded")
+	}
+	if changed, _ := e.life.MarkSending(ctx, m.ID, m.CreatedAt); changed {
+		t.Error("unknown -> sending was allowed")
+	}
+	if s := e.status(t, m.ID); s != sms.StatusUnknown {
+		t.Errorf("status = %q, want unknown", s)
+	}
+	if b := e.balance(t, 1); b != 1000-price {
+		t.Errorf("balance = %d, want %d (no refund)", b, 1000-price)
 	}
 }

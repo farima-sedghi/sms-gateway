@@ -58,6 +58,37 @@ curl -s -X POST localhost:8081/messages \
 - A request rejected with 402 does not store the key: top up and retry with the
   same key.
 
+### What happens after 202
+
+The message is charged and queued. The dispatcher then hands it to the
+operator, and its status ends as one of:
+
+| Status | Meaning | Charged? |
+|--------|---------|----------|
+| `sent` | The operator accepted it | Yes |
+| `failed` | Certainly not delivered: the operator rejected it, retries ran out, or an express message expired (`EXPRESS_TTL`, default 2m) | No, refunded |
+| `unknown` | Maybe delivered: the operator never answered and retries ran out | Yes, until reconciled with the operator |
+
+In between it is `queued`, `sending` or `retrying`.
+
+## Fake operator (`operator-mock`)
+
+Configure it in `.env` (see `.env.example`), then run `make up`:
+
+| Variable | Effect |
+|----------|--------|
+| `OPERATOR_LATENCY` | Time for a successful send (default 50ms) |
+| `OPERATOR_TEMP_FAILURE_RATE` | Share of requests answered 503: the message is retried |
+| `OPERATOR_PERM_FAILURE_RATE` | Share answered 400: the message fails and is refunded |
+| `OPERATOR_TIMEOUT_RATE` | Share delivered but answered only after `OPERATOR_TIMEOUT_DELAY` (outcome unknown) |
+
+It dedupes by message id, as a real operator would. `curl localhost:8090/stats`
+shows `{"sends": N, "duplicates": M}`, and `duplicates` counts requests answered
+from the dedupe map, which were not sent again.
+
+Example: `OPERATOR_PERM_FAILURE_RATE=1 docker compose -f deployments/docker-compose.yml --env-file .env up -d operator-mock`
+makes every message fail and get refunded.
+
 ## Services
 
 | Service         | Host port | What it does                                   |

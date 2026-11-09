@@ -101,6 +101,7 @@ services:
       <<: *app-env
       HTTP_ADDR: :8080
       SMS_PRICE: ${SMS_PRICE:-100}
+      EXPRESS_TTL: ${EXPRESS_TTL:-2m}
     ports: ["${API_PORT:-8081}:8080"]
     depends_on: *app-depends
     healthcheck:
@@ -118,6 +119,16 @@ services:
     environment:
       <<: *app-env
       OPERATOR_URL: http://operator-mock:8090
+      OPERATOR_TIMEOUT: ${OPERATOR_TIMEOUT:-5s}
+      MAX_ATTEMPTS: ${MAX_ATTEMPTS:-5}
+      RETRY_BASE_DELAY: ${RETRY_BASE_DELAY:-1s}
+      RETRY_MAX_DELAY: ${RETRY_MAX_DELAY:-30s}
+      EXPRESS_WORKERS: ${EXPRESS_WORKERS:-32}
+      EXPRESS_BATCH_SIZE: ${EXPRESS_BATCH_SIZE:-64}
+      NORMAL_WORKERS: ${NORMAL_WORKERS:-64}
+      NORMAL_BATCH_SIZE: ${NORMAL_BATCH_SIZE:-256}
+      RETRY_WORKERS: ${RETRY_WORKERS:-16}
+      RETRY_BATCH_SIZE: ${RETRY_BATCH_SIZE:-64}
     depends_on:
       <<: *app-depends
       operator-mock:
@@ -149,7 +160,10 @@ services:
       HTTP_ADDR: :8090
       LOG_LEVEL: ${LOG_LEVEL:-info}
       OPERATOR_LATENCY: ${OPERATOR_LATENCY:-50ms}
-      OPERATOR_FAILURE_RATE: ${OPERATOR_FAILURE_RATE:-0}
+      OPERATOR_TEMP_FAILURE_RATE: ${OPERATOR_TEMP_FAILURE_RATE:-0}
+      OPERATOR_PERM_FAILURE_RATE: ${OPERATOR_PERM_FAILURE_RATE:-0}
+      OPERATOR_TIMEOUT_RATE: ${OPERATOR_TIMEOUT_RATE:-0}
+      OPERATOR_TIMEOUT_DELAY: ${OPERATOR_TIMEOUT_DELAY:-30s}
     ports: ["${OPERATOR_PORT:-8090}:8090"]
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8090/healthz"]

@@ -72,9 +72,9 @@ func TestIdempotencyKeyLength(t *testing.T) {
 
 // Terminal states must never be a source of any transition.
 func TestTerminalStatesHaveNoOutgoingTransitions(t *testing.T) {
-	for _, to := range []Status{StatusQueued, StatusSending, StatusRetrying, StatusSent, StatusFailed} {
+	for _, to := range []Status{StatusQueued, StatusSending, StatusRetrying, StatusSent, StatusFailed, StatusUnknown} {
 		from := allowedFrom(to)
-		if slices.Contains(from, StatusSent) || slices.Contains(from, StatusFailed) {
+		if slices.Contains(from, StatusSent) || slices.Contains(from, StatusFailed) || slices.Contains(from, StatusUnknown) {
 			t.Errorf("transition to %q allowed from a terminal state: %v", to, from)
 		}
 	}
