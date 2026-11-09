@@ -1,156 +1,253 @@
 # SMS Gateway
 
-A prepaid SMS gateway, written in Go, for ~100M messages/day. Customers top up a
-balance, send SMS (normal or express) through a REST API, and fetch reports of
-what they sent.
+A prepaid SMS gateway in Go, designed for about 100M messages a day. Businesses
+top up a balance, send normal or express SMS through a REST API, and fetch
+reports of what they sent. The balance never goes negative, and express messages
+have their own path to the operator, so normal traffic can't slow them down.
 
-Architecture: [docs/architecture.md](docs/architecture.md) · Decisions: [docs/adr/](docs/adr/)
+- **Architecture, capacity, failure modes:** [docs/architecture.md](docs/architecture.md)
+- **Design decisions:** [docs/adr/](docs/adr/) (ADRs 0001–0007)
+
+Stack: Go 1.22 (`net/http`, `log/slog`), PostgreSQL 16 (pgx), Kafka in KRaft
+mode (franz-go), golang-migrate, Docker Compose.
 
 ## Quick start
 
-Requirements: Docker Engine with `docker compose` v2, Go 1.22+, `make`.
+Requirements: Docker Engine with Compose v2. Go 1.22+ and `make` are needed only
+to run the tests.
 
 ```bash
-cp .env.example .env        # optional: override ports, GOPROXY, etc.
-make up                     # builds images, starts everything
-make ps                     # all services healthy; migrate and kafka-init exited 0
+cp .env.example .env          # defaults work; edit ports, limits or GOPROXY if needed
+docker compose -f deployments/docker-compose.yml --env-file .env up -d --build
+# or: make up
+
 curl -s localhost:8081/readyz
-# {"kafka":"ok","postgres":"ok"}
-make topics                 # describe Kafka topics
-make down                   # stop (make clean also deletes volumes)
+# {"postgres":"ok"}
 ```
+
+Compose starts Postgres and Kafka, runs the migrations and creates the topics,
+then starts `api`, `outbox-relay`, `dispatcher`, `operator-mock` and `kafka-ui`.
+Check status with `make ps` (or `docker compose ... ps -a`). Stop with
+`make down`; `make clean` also deletes the data volumes.
 
 ## API
 
-Amounts are integers in minor units (e.g. rials), never decimals. The price of
-one SMS is set by `SMS_PRICE`.
+Base URL `http://localhost:8081`. All amounts are **integers in minor units**
+(e.g. rials), never decimals. The price of one SMS is `SMS_PRICE` (default 100).
+Errors always look like `{"error": "..."}`.
 
+### Health
 ```bash
-# Top up (creates the wallet on first use)
+curl -s localhost:8081/healthz     # liveness: the process is up
+# {"status":"ok"}
+curl -s localhost:8081/readyz      # readiness: Postgres reachable (503 otherwise)
+# {"postgres":"ok"}
+```
+
+### Wallet
+```bash
+# Top up. The wallet is created on first use. Returns the new balance.
 curl -s -X POST localhost:8081/customers/42/topup -d '{"amount": 1000}'
 # {"customer_id":42,"balance":1000}
 
-# Balance
+# Balance (0 for a customer that never topped up)
 curl -s localhost:8081/customers/42/balance
+# {"customer_id":42,"balance":1000}
+```
+An `amount` that is ≤ 0 or above 10¹² returns 400.
 
-# Send an SMS (priority: "normal" (default) or "express")
-curl -s -X POST localhost:8081/messages \
+### Send an SMS
+```bash
+curl -s -i -X POST localhost:8081/messages \
   -H 'Idempotency-Key: order-123' \
   -d '{"customer_id": 42, "recipient": "+989121234567", "body": "سلام", "priority": "express"}'
-# 202 {"message_id":"019a...","status":"queued","priority":"express","cost":100,"created_at":"..."}
+# HTTP/1.1 202 Accepted
+# {"message_id":"01a1bfc0-a46f-7e21-8c84-0e795a169c81","status":"queued","priority":"express",
+#  "cost":100,"created_at":"2026-11-09T10:00:35.696009Z"}
 ```
 
-| Status | When |
-|-------:|------|
-| 202 | Message accepted, charged and queued |
-| 400 | Invalid JSON, recipient, body (must fit one SMS page), priority or Idempotency-Key |
-| 402 | Balance lower than the message price |
-| 409 | Idempotency-Key already used with a different request body |
-| 429 | Sending faster than your rate limit; retry after the `Retry-After` seconds. Nothing is charged |
+| Field | Rules |
+|---|---|
+| `customer_id` | positive integer (there is no auth; see the assumptions in the architecture doc) |
+| `recipient` | 8–15 digits, optional leading `+` |
+| `body` | not empty, one SMS page: 160 Latin/GSM characters, or 70 for other scripts (e.g. Persian) |
+| `priority` | `normal` (default) or `express` |
+| `Idempotency-Key` header | optional, at most 255 characters, scoped per customer |
 
-### Idempotency-Key (optional, recommended)
+| Status | When | Example body |
+|---:|---|---|
+| 202 | Accepted, charged and queued | as above |
+| 400 | Invalid JSON, unknown field, recipient, body, priority or key | `{"error":"validation failed: recipient must be 8-15 digits, optionally starting with +"}` |
+| 402 | Balance lower than the price | `{"error":"insufficient balance"}` |
+| 409 | Idempotency-Key reused with a different body | `{"error":"idempotency key reused with a different request"}` |
+| 429 | Over your rate limit. The `Retry-After` header gives seconds. Not charged. | `{"error":"rate limit exceeded: retry after 913.832406ms"}` |
 
-- With a key (max 255 characters, scoped per customer): retrying the same request
-  returns the original response with the header `Idempotent-Replayed: true`, and
-  you are charged only once. Reusing the key with a different body returns 409.
-- **Without a key there is no retry protection.** If a request times out and
-  you retry, the message may be **sent and charged twice**. Always send a key if
-  your client retries.
-- A request rejected with 402 does not store the key: top up and retry with the
+**Idempotency-Key (recommended).**
+- Sending the same request again with the same key returns the original 202
+  response, with the header `Idempotent-Replayed: true`, and charges nothing.
+- **Without a key there is no retry protection.** If a request times out and you
+  retry, the message may be **sent and charged twice**.
+- A request rejected with 402 does not use up its key: top up and retry with the
   same key.
 
-### Rate limits
-
-Each customer has a token bucket per priority: by default 200 msg/s (burst
-400) for normal and 50 msg/s (burst 100) for express. The limits are separate,
-so heavy normal traffic never uses up your express allowance. Over the limit
-you get `429` with `Retry-After`, and the request is not charged.
-
-### Reports
+**Rate limits.**
+- Each customer has a token bucket per priority, so heavy normal traffic never
+  uses up the express allowance.
+- Customers without a plan get the defaults: normal 200 msg/s (burst 400) and
+  express 50 msg/s (burst 100).
+- A customer can be given its own plan:
 
 ```bash
-# Your messages in a time range (from inclusive, to exclusive, at most 31 days), newest first
-curl -s 'localhost:8081/customers/42/messages?from=2026-11-01T00:00:00Z&to=2026-11-10T00:00:00Z&limit=50'
-# {"messages":[{"message_id":"...","recipient":"...","priority":"normal","status":"sent",
-#   "cost":100,"attempts":1,"created_at":"...","handed_at":"...","last_error":null}, ...],
-#  "next_cursor":"eyJ0Ijoi..."}
-
-# Next page: pass next_cursor back unchanged, with the same from/to/status
-curl -s 'localhost:8081/customers/42/messages?from=...&to=...&limit=50&cursor=eyJ0Ijoi...'
-
-# Only failed messages
-curl -s 'localhost:8081/customers/42/messages?from=...&to=...&status=failed'
-
-# One message
-curl -s localhost:8081/customers/42/messages/019a...
+curl -s -X PUT localhost:8081/customers/42/limits \
+  -d '{"normal_rps": 2000, "express_rps": 100, "burst": 4000}'
+# {"customer_id":42,"normal_rps":2000,"express_rps":100,"burst":4000}
 ```
-
-`next_cursor` is `null` on the last page. `status` can be `queued`, `sending`,
-`retrying`, `sent`, `failed` or `unknown`. `limit` is 1-100 (default 50).
+Each value must be 1–100,000. The plan applies at once on the instance that
+received the PUT, and within 10 s on the others. `burst` is the bucket size for
+both priorities.
 
 ### What happens after 202
+The dispatcher hands the message to the operator. The final status is one of:
 
-The message is charged and queued. The dispatcher then hands it to the
-operator, and its status ends as one of:
+| Status | Meaning | Charged |
+|---|---|---|
+| `sent` | Handed to the operator (not a handset delivery report) | yes |
+| `failed` | Certainly not delivered: rejected by the operator, retries exhausted, or an express message older than `EXPRESS_TTL` (2 min) | **no, refunded once** |
+| `unknown` | Maybe delivered: the operator never answered and retries ran out | yes, until reconciled |
 
-| Status | Meaning | Charged? |
-|--------|---------|----------|
-| `sent` | The operator accepted it | Yes |
-| `failed` | Certainly not delivered: the operator rejected it, retries ran out, or an express message expired (`EXPRESS_TTL`, default 2m) | No, refunded |
-| `unknown` | Maybe delivered: the operator never answered and retries ran out | Yes, until reconciled with the operator |
+In between, the status is `queued`, `sending` or `retrying`.
 
-In between it is `queued`, `sending` or `retrying`.
+### Reports
+```bash
+# Messages in [from, to): RFC3339, required, at most 31 days. Newest first.
+curl -s 'localhost:8081/customers/42/messages?from=2026-11-09T00:00:00Z&to=2026-11-10T00:00:00Z&limit=1'
+# {"messages":[{"message_id":"01a1bfc0-a46f-7e21-8c84-0e795a169c81","recipient":"+989121234567",
+#   "priority":"express","status":"sent","cost":100,"attempts":1,
+#   "created_at":"2026-11-09T10:00:35.696009Z","handed_at":"2026-11-09T10:00:35.79617Z",
+#   "last_error":null}],
+#  "next_cursor":"eyJ0IjoiMjAyNi0xMS0wOVQx..."}
 
-## Fake operator (`operator-mock`)
+# Next page: same from/to/status, plus the cursor exactly as returned
+curl -s 'localhost:8081/customers/42/messages?from=2026-11-09T00:00:00Z&to=2026-11-10T00:00:00Z&limit=1&cursor=eyJ0IjoiMjAyNi0xMS0wOVQx...'
 
-Configure it in `.env` (see `.env.example`), then run `make up`:
+# Filter by status
+curl -s 'localhost:8081/customers/42/messages?from=2026-11-09T00:00:00Z&to=2026-11-10T00:00:00Z&status=failed'
+
+# One message
+curl -s localhost:8081/customers/42/messages/01a1bfc0-a46f-7e21-8c84-0e795a169c81
+# {"message_id":"01a1bfc0-a46f-7e21-8c84-0e795a169c81","recipient":"+989121234567","priority":"express",
+#  "status":"sent","cost":100,"attempts":1,"created_at":"2026-11-09T10:00:35.696009Z",
+#  "handed_at":"2026-11-09T10:00:35.79617Z","last_error":null}
+```
+- `limit` is 1–100 (default 50). `next_cursor` is `null` on the last page.
+- `status` is one of `queued`, `sending`, `retrying`, `sent`, `failed` or
+  `unknown`.
+- A range over 31 days, a missing `from`/`to`, or a cursor reused with different
+  filters returns 400.
+- Another customer's message returns 404.
+
+### Fake operator (`operator-mock`, port 8090)
+```bash
+curl -s localhost:8090/stats
+# {"sends":142,"duplicates":0}
+```
+It dedupes by message id, as a real operator would: `duplicates` counts repeat
+requests that were answered without sending again.
+
+Its behaviour is set in `.env`:
 
 | Variable | Effect |
-|----------|--------|
-| `OPERATOR_LATENCY` | Time for a successful send (default 50ms) |
-| `OPERATOR_TEMP_FAILURE_RATE` | Share of requests answered 503: the message is retried |
-| `OPERATOR_PERM_FAILURE_RATE` | Share answered 400: the message fails and is refunded |
-| `OPERATOR_TIMEOUT_RATE` | Share delivered but answered only after `OPERATOR_TIMEOUT_DELAY` (outcome unknown) |
+|---|---|
+| `OPERATOR_LATENCY` | latency of a successful send (default 50ms) |
+| `OPERATOR_TEMP_FAILURE_RATE` | share answered 503, so the message is retried |
+| `OPERATOR_PERM_FAILURE_RATE` | share answered 400, so the message fails and is refunded |
+| `OPERATOR_TIMEOUT_RATE` | share delivered but answered after `OPERATOR_TIMEOUT_DELAY`, so the outcome is unknown |
 
-It dedupes by message id, as a real operator would. `curl localhost:8090/stats`
-shows `{"sends": N, "duplicates": M}`, and `duplicates` counts requests answered
-from the dedupe map, which were not sent again.
+To make every message fail and be refunded:
+`OPERATOR_PERM_FAILURE_RATE=1 docker compose -f deployments/docker-compose.yml --env-file .env up -d operator-mock`
 
-Example: `OPERATOR_PERM_FAILURE_RATE=1 docker compose -f deployments/docker-compose.yml --env-file .env up -d operator-mock`
-makes every message fail and get refunded.
+## Running the tests
+
+The tests use the **real Postgres and Kafka** from the compose stack, not mocks.
+Each test creates its own database and Kafka topics and deletes them afterwards.
+
+```bash
+docker compose -f deployments/docker-compose.yml --env-file .env up -d postgres kafka kafka-init
+make test
+# or without make:
+TEST_DATABASE_URL='postgres://sms:sms@localhost:5432/sms?sslmode=disable' \
+TEST_KAFKA_BROKERS=localhost:29092 \
+go test -race -count=1 ./...
+```
+
+Without those two environment variables, the database and Kafka tests are
+skipped and only the pure unit tests run. What's covered:
+- 100 concurrent debits never overspend;
+- idempotent replays and conflicts;
+- exactly-once refunds;
+- duplicate and late Kafka deliveries;
+- unknown outcomes are never refunded;
+- the circuit breaker;
+- outbox lanes and parallel relays;
+- keyset pagination, including ties;
+- partition pruning;
+- rate limiting.
+
+## Load test
+
+```bash
+make loadtest      # needs the stack running; k6 runs in Docker (grafana/k6:0.54.0)
+# or one run with your own numbers:
+HEAVY_CUSTOMERS=10 HEAVY_RATE=800 EXPRESS_RATE=100 DURATION_S=120 ./loadtest/run.sh capacity
+HEAVY_RATE=1000 ./loadtest/run.sh fairness
+```
+- **capacity:** heavy customers on a high plan plus 100 express customers.
+- **fairness:** one heavy customer above its default plan; it must get 429s
+  while express is unaffected.
+
+Each run writes `loadtest/results/<mode>-<run_id>.txt`, containing:
+- the k6 summary;
+- a `docker stats` snapshot taken mid-run;
+- p50/p95/p99 of accept → handed per priority, from
+  [`loadtest/latency.sql`](loadtest/latency.sql), after the backlog drains.
+
+Results and the capacity extrapolation are in
+[architecture.md §10](docs/architecture.md#10-load-test-results). For
+comparable numbers, start the stack with `LOG_LEVEL=warn`.
 
 ## Services
 
-| Service         | Host port | What it does                                   |
-|-----------------|----------:|------------------------------------------------|
-| `api`           | 8081      | REST API (`/healthz`, `/readyz`)               |
-| `dispatcher`    | —         | Kafka consumers -> operator                    |
-| `outbox-relay`  | —         | Outbox table -> Kafka                          |
-| `operator-mock` | 8090      | Fake operator (configurable latency/failures)  |
-| `postgres`      | 5432      | PostgreSQL 16                                  |
-| `kafka`         | 29092     | Kafka (KRaft) for host tools; `kafka:9092` inside the network |
-| `kafka-ui`      | 8080      | Browse topics and consumer groups              |
-| `migrate`       | —         | One-shot: applies `migrations/`                |
-| `kafka-init`    | —         | One-shot: creates topics                       |
+| Service | Host port | What it does |
+|---|---:|---|
+| `api` | 8081 | REST API |
+| `outbox-relay` | — | outbox table → Kafka, one loop per lane |
+| `dispatcher` | — | Kafka → operator; status updates, retries, refunds |
+| `operator-mock` | 8090 | fake operator |
+| `postgres` | 5432 | PostgreSQL 16 |
+| `kafka` | 29092 | Kafka (KRaft) for host tools; `kafka:9092` inside the network |
+| `kafka-ui` | 8080 | browse topics and consumer groups |
+| `migrate` | — | one-shot: applies `migrations/` |
+| `kafka-init` | — | one-shot: creates topics |
+
+All configuration is through environment variables. Every variable, with its
+default and meaning, is in [`.env.example`](.env.example).
 
 ## Layout
 
 ```
-cmd/            one main.go per binary (api, dispatcher, outbox-relay, operator-mock)
-internal/       modules: wallet, sms, dispatch, report, ratelimit, outbox, operator
-  platform/     shared setup: config, logging, postgres, kafka, httpserver
+cmd/            one main.go per binary: api, outbox-relay, dispatcher, operator-mock
+internal/       modules (domain, service, repository, handler as files):
+  wallet/       balances, ledger, top-up, debit, refund
+  sms/          accept messages (idempotency, debit, outbox), status lifecycle
+  outbox/       transactional outbox and the relay
+  dispatch/     Kafka consumers, retries, DLQ
+  operator/     operator HTTP client (error classes, circuit breaker) and mock
+  report/       read-only reports
+  ratelimit/    per-customer token buckets and plans (customer_limits)
+  platform/     config, logging, postgres, kafka, httpserver, backoff
 migrations/     golang-migrate SQL files
 deployments/    docker-compose and helper scripts
-docs/           architecture and ADRs
+docs/           architecture.md and ADRs
 ```
 
-`make help` lists every target.
-
-## Renaming the Go module
-
-The module path is a placeholder. To use your own:
-
-```bash
-go mod edit -module github.com/<you>/sms-gateway
-grep -rl 'github.com/your-user/sms-gateway' --include='*.go' . | xargs sed -i 's#github.com/your-user/sms-gateway#github.com/<you>/sms-gateway#g'
-```
+`make help` lists every make target.

@@ -36,17 +36,29 @@ Build a **modular monolith with several binaries**:
   (`<module>.go` domain, `service.go`, `repository.go`, `handler.go`).
 - **Each module owns its tables.** Other modules call its exported Go functions and
   never query its tables.
-- Dependencies go one way: `sms -> wallet, outbox`; `dispatch -> wallet, operator`;
-  `report` is read-only; `wallet` depends only on `platform`. No cycles. The Go
-  compiler rejects import cycles anyway, which helps enforce this.
+- Dependencies go one way: `sms -> wallet, outbox`; `dispatch -> sms` (the
+  `Lifecycle` status transitions, which call `wallet.Refund` inside) and
+  `operator`; `report` only reads `messages`; `wallet` depends only on `platform`.
+  No cycles. The Go compiler rejects import cycles anyway, which helps enforce this.
 
 ### Controlled exception: shared transaction
 
 `sms` starts a `pgx.Tx` and passes it to `wallet.Debit(ctx, tx, ...)` and
-`outbox.Enqueue(ctx, tx, ...)`. The debit, ledger row, message row and outbox row
+`outbox.Insert(ctx, tx, ...)`. The debit, ledger row, message row and outbox row
 then commit or roll back together. This is a deliberate coupling. It stays explicit
 because the transaction is a parameter of the function signature. `wallet` still
 owns its SQL; `sms` only supplies the transaction.
+
+## Alternatives considered
+- *Microservices (wallet, sms, dispatch as separate services and databases):*
+  rejected because debit + message atomicity would need a saga. Also too much
+  operational overhead for the scope.
+- *Single binary doing everything:* rejected because API and dispatchers scale on
+  different signals, and a slow operator must not take request-handling CPU away
+  from the API.
+- *Layer-first folders (`controllers/`, `services/`, `repositories/`):* rejected.
+  A change to one feature touches every folder, and nothing shows which code may
+  touch which table. Module-first keeps a feature and its tables together.
 
 ## Consequences
 
@@ -67,11 +79,3 @@ owns its SQL; `sms` only supplies the transaction.
   the "no cross-module table access" rule do. A Go `internal/` sub-tree per module
   can tighten this later.
 - All binaries share a release cycle.
-
-**Alternatives considered**
-- *Microservices (wallet, sms, dispatch as separate services and databases):*
-  rejected because debit + message atomicity would need a saga. Also too much
-  operational overhead for the scope.
-- *Single binary doing everything:* rejected because API and dispatchers scale on
-  different signals, and a slow operator must not take request-handling CPU away
-  from the API.

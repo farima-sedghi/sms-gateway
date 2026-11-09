@@ -435,7 +435,7 @@ func TestHTTP429WithRetryAfter(t *testing.T) {
 	e.topUp(t, 1, 1000)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	limiter := ratelimit.NewMemory(ratelimit.Config{
-		Classes: map[string]ratelimit.Limit{"normal": {Rate: 0.5, Burst: 1}}, // 1 token per 2s
+		Limits: ratelimit.Static(map[string]ratelimit.Limit{"normal": {Rate: 0.5, Burst: 1}}), // 1 token per 2s
 	}, log)
 	mux := http.NewServeMux()
 	sms.NewHandler(sms.NewService(e.pool, price, 2*time.Minute, limiter), log).Register(mux)

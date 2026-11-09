@@ -23,8 +23,8 @@ paid for and never sent, or sent and never recorded.
 1. **Kafka** (KRaft mode, no ZooKeeper) with client `twmb/franz-go`.
 2. **Transactional outbox.** The API writes an `outbox` row in the same transaction
    as the debit and the message. `outbox-relay` polls with
-   `SELECT ... FOR UPDATE SKIP LOCKED`, publishes, and marks rows sent.
-   Delivery is **at-least-once**.
+   `SELECT ... FOR UPDATE SKIP LOCKED`, publishes, and sets `published_at`.
+   Delivery is **at-least-once**. The relay runs one loop per topic lane (ADR 0004).
 3. **Topics** (created explicitly by `kafka-init`; auto-create is off):
 
    | Topic         | Partitions | Purpose                                       |
@@ -33,16 +33,29 @@ paid for and never sent, or sent and never recorded.
    | `sms.normal`  | 12         | Normal messages (bulk of the traffic)         |
    | `sms.retry`   | 6          | Failed sends with attempt count and backoff   |
    | `sms.dlq`     | 3          | Exhausted retries, for inspection             |
-   | `sms.status`  | 6          | Status events (sent/failed)                   |
+   | `sms.status`  | 6          | Reserved for status events (not produced yet; feeds ClickHouse/DLR later) |
 
 4. **Partition key = `message_id`**, not `customer_id`. A few customers send at huge
    rates. Keying by customer would pin each heavy customer to one partition and one
    consumer, which creates hot partitions. Keying by message spreads load evenly.
    We don't need per-customer ordering: every SMS is independent.
 5. **Idempotent consumers.** Duplicates (from the outbox or consumer rebalances) are
-   neutralised by guarded status transitions in SQL
-   (`UPDATE ... WHERE status = 'queued'`). Offsets are committed only after
-   processing finishes.
+   neutralised by guarded status transitions in SQL, each with an allow-list of
+   source states (`UPDATE ... WHERE status = ANY(<allowed>)`, ADR 0003/0005).
+   Offsets are committed only after a whole batch is processed.
+
+## Alternatives considered
+- *RabbitMQ:* has good per-message ack and delayed queues, but lower throughput per
+  node, no replay, and harder horizontal scaling at this volume.
+- *Postgres as the queue (SKIP LOCKED workers only):* simplest, but puts all queue
+  churn on the same database that guards money. It becomes the bottleneck at
+  100M rows/day.
+- *Redis Streams:* fast, but memory-bound with weaker durability guarantees.
+- *Publishing to Kafka directly from the API (no outbox):* rejected. This is the
+  dual write: a crash or Kafka error after the commit leaves a paid message that
+  is never sent.
+- *Partition key = customer_id:* rejected. It would give per-customer ordering,
+  which we don't need, and hot partitions for the heaviest senders.
 
 ## Consequences
 
@@ -63,11 +76,3 @@ paid for and never sent, or sent and never recorded.
   (it waits until `next_attempt_at`). Tiered retry topics are the future option.
 - Partition count caps parallelism per group. Partitions can be increased later
   (key-to-partition mapping changes, which is fine with no ordering requirement).
-
-**Alternatives considered**
-- *RabbitMQ:* has good per-message ack and delayed queues, but lower throughput per
-  node, no replay, and harder horizontal scaling at this volume.
-- *Postgres as the queue (SKIP LOCKED workers only):* simplest, but puts all queue
-  churn on the same database that guards money. It becomes the bottleneck at
-  100M rows/day.
-- *Redis Streams:* fast, but memory-bound with weaker durability guarantees.

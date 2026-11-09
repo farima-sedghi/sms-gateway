@@ -1,4 +1,4 @@
-  # ADR 0005: Dispatcher, operator errors and circuit breaker
+# ADR 0005: Dispatcher, operator errors and circuit breaker
 
 - **Status:** Accepted
 - **Date:** 2026-11-09
@@ -119,6 +119,26 @@ delay.
 - It is checked before every send, including after waiting for the breaker.
 - An expired express message is not sent: `failed` + refund, or `unknown` if it
   is uncertain.
+
+## Alternatives considered
+- *Refund on any error after the retries run out, including timeouts:* simpler,
+  but refunds messages the operator may have delivered: free SMS and an
+  unreconcilable ledger. Unknown outcomes are never refunded.
+- *A delay-capable broker (RabbitMQ delayed exchange, SQS delay) for retries:*
+  per-message delays with no head-of-line effect, but a second broker to run.
+  Kafka plus `next_attempt_at` is good enough with the 30s cap.
+- *Tiered retry topics (`sms.retry.1s`, `sms.retry.30s`, ...):* removes the
+  head-of-line delay inside the retry topic. It is the next step if retry volume
+  grows.
+- *Commit offsets per record or per partition prefix:* less redelivery after a
+  crash and no batch barrier, but more bookkeeping. Batch commits plus
+  idempotent handling are simpler and correct.
+- *No circuit breaker (just retries):* during an outage every message burns its
+  attempts against a dead operator and floods `sms.retry`, then fails and is
+  refunded although the operator would have come back.
+- *Forbid re-entry into `sending`:* a crash between `MarkSending` and the send
+  would leave the message stuck in `sending` forever. Re-entry plus operator
+  dedupe by ref is safe.
 
 ## Consequences
 

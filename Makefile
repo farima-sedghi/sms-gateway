@@ -4,7 +4,7 @@ COMPOSE := docker compose -f deployments/docker-compose.yml $(if $(wildcard .env
 GO      := GOTOOLCHAIN=local go
 
 .DEFAULT_GOAL := help
-.PHONY: help build test lint fmt tidy up down clean logs ps topics migrate-up
+.PHONY: help build test lint fmt tidy up down clean logs ps topics migrate-up loadtest
 
 help: ## Show targets
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-12s %s\n", $$1, $$2}'
@@ -50,3 +50,8 @@ topics: ## Describe Kafka topics
 
 migrate-up: ## Re-run migrations
 	$(COMPOSE) run --rm migrate
+
+# The runs documented in docs/architecture.md §10.
+loadtest: ## Load test (k6 in Docker): capacity run, then fairness run. Needs `make up`
+	HEAVY_CUSTOMERS=10 HEAVY_RATE=800 ./loadtest/run.sh capacity
+	HEAVY_CUSTOMERS=1 HEAVY_RATE=1000 ./loadtest/run.sh fairness

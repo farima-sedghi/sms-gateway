@@ -1,6 +1,6 @@
 # ADR 0007: Per-customer rate limiting
 
-- **Status:** Accepted
+- **Status:** Accepted (amended 2026-11-09: per-customer plans, section 6)
 - **Date:** 2026-11-09
 
 ## Context
@@ -22,9 +22,11 @@ a latency guarantee that a normal flood must not break.
 
 | Env | Default | Meaning |
 |-----|--------:|---------|
-| `RATE_LIMIT_NORMAL_RPS` / `_BURST` | 200 / 400 | per customer, global |
-| `RATE_LIMIT_EXPRESS_RPS` / `_BURST` | 50 / 100 | per customer, global |
+| `RATE_LIMIT_NORMAL_RPS` / `_BURST` | 200 / 400 | default for customers **without a plan**, global |
+| `RATE_LIMIT_EXPRESS_RPS` / `_BURST` | 50 / 100 | default for customers **without a plan**, global |
 | `API_INSTANCES` | 1 | API replicas sharing the limit |
+
+Customers with a plan in `customer_limits` use that plan instead (section 6).
 
 A token bucket allows short bursts, which real senders have, while capping the
 long-run rate. It needs constant memory per key.
@@ -72,6 +74,54 @@ Each API process enforces `global / API_INSTANCES` (burst at least 1).
 - One mutex guards the map, and each `rate.Limiter` has its own lock, so the map
   lock is held only for the lookup. If contention shows up in profiles, the
   next step is to shard the map by `customer_id % N`.
+
+### 6. Per-customer plans (amendment)
+One default for everyone doesn't fit the load: a few customers legitimately
+send hundreds of messages per second, most send a few per hour. Each customer
+can therefore have a **plan**.
+- **Table** `customer_limits(customer_id, normal_rps, express_rps, burst)`,
+  owned by `ratelimit`. There is no row for most customers, who get the env
+  defaults. `burst` is the bucket size for both classes of a planned customer.
+- **Set with** `PUT /customers/{id}/limits {"normal_rps","express_rps","burst"}`
+  (each 1..100,000). There is no auth, like the rest of the API; in production
+  this is an admin route.
+- **No database read per request.** `PlanCache` holds every plan in a map
+  behind an `atomic.Pointer`: lookups take no lock, and a refresh swaps in a new
+  map. It reloads all rows every **10 s**. The instance that handles a PUT
+  updates its own copy at once; the others pick it up within 10 s. If a refresh
+  fails, the previous plans are kept, because stale limits beat no limits.
+  A full reload is milliseconds for tens of thousands of rows. Beyond that, load
+  only `updated_at > last refresh`.
+- **Plan changes apply to live buckets.** On each request the bucket's rate and
+  burst are compared to the current plan and updated in place
+  (`SetLimitAt`/`SetBurstAt`). Saved tokens are kept, capped at the new burst.
+- **Eviction** keeps each bucket for at least its own refill time
+  (`burst / rate`), which now differs per customer. It still never changes a
+  decision.
+- **Per instance**, a plan is divided by `API_INSTANCES` like the defaults.
+  Redis (below) removes that approximation.
+- **Plans above the hot-wallet ceiling don't help.** One customer's debits
+  serialize on its single wallet row (architecture §2). A plan above that rate
+  needs sub-wallets as well (architecture §9).
+
+## Alternatives considered
+- *Fixed-window counter (N per second):* simple, but allows 2N at a window
+  boundary and no bursts in a quiet window.
+- *Sliding log:* exact, but stores one timestamp per request per customer.
+- *Redis limiter now:* exact across instances, but adds a dependency and a
+  network hop to the hot path. Documented below as the production path.
+- *Limiting at the gateway (nginx/Envoy):* good for per-IP limits, but the
+  customer id is in the JSON body and the class (express/normal) needs parsing.
+  It belongs in the application.
+- *One global limit, not per customer:* protects the system but not fairness:
+  one heavy customer can use all of it.
+- *Limiting after the debit (or refunding tokens on 402):* the limiter would no
+  longer protect the database, and failing requests would become free.
+- *Reading the plan from Postgres on every request:* always fresh, but adds a
+  query to every accept, on the same database the limiter is protecting. A 10 s
+  cache is fresh enough for a commercial plan change.
+- *Raising the global default for everyone:* would let every customer flood the
+  system to give a few heavy senders room.
 
 ## Production path: Redis (documented, not built)
 A shared limiter makes the limit exact regardless of instance count or load

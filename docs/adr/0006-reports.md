@@ -94,6 +94,22 @@ mean scanning many rows per page. If that becomes a real query pattern, a
 partial index such as `(customer_id, created_at DESC) WHERE status = 'failed'`
 is the targeted fix.
 
+## Alternatives considered
+- *OFFSET pagination:* simple, but page N reads and discards every earlier row,
+  and pages shift as new messages arrive.
+- *Cursor on `created_at` only:* skips or repeats rows that share a timestamp
+  across a page boundary. The test for that fails without `id`.
+- *Index `(customer_id, created_at DESC, id DESC)`:* no sort for ties, but a
+  wider index on every one of ~100M daily inserts. Deferred until ties are common.
+- *No required range (or a larger maximum):* the query would touch every daily
+  partition ever created, and its cost would grow with history, not page size.
+- *Get by id with the primary key only (`WHERE id = $1`):* the primary key is
+  `(id, created_at)`, so without `created_at` Postgres probes the index of every
+  partition.
+- *Serving reports from ClickHouse now:* the right tool for aggregates, but
+  another system to build. The OLTP query is cheap with keyset pagination and
+  pruning.
+
 ## Consequences
 - Report latency depends on page size, not on history size or page depth.
 - Heavy analytics (totals per day, status breakdowns over months) don't belong on

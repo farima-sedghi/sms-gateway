@@ -102,6 +102,28 @@ documented as not idempotent by itself.
   creating that date's partition later fails until those rows are moved. The job
   must stay ahead.
 
+## Alternatives considered
+- *`SELECT ... FOR UPDATE`, check in Go, then `UPDATE`:* correct, but two round
+  trips while holding the row lock. The conditional UPDATE does the check and the
+  write in one statement.
+- *SERIALIZABLE isolation:* safe, but under contention on a hot wallet,
+  serialization failures need application retries. READ COMMITTED plus a
+  conditional UPDATE is enough.
+- *Balance computed from the ledger on every debit (no cached balance):* exact,
+  but `SUM()` over a growing ledger on the hot path doesn't scale. The cache is
+  updated in the same transaction, and the invariant is checked by tests and by
+  reconciliation.
+- *Idempotency key as a unique column on `messages`:* impossible across
+  partitions (a unique index must include `created_at`), and it mixes request
+  deduplication with message data.
+- *Unique index on `ledger_entries(message_id) WHERE kind = 'refund'` for refund
+  idempotency:* impossible across partitions, and it puts message rules in the
+  ledger. The guarded status transition does it in the owning module.
+- *A deny-list guard (`WHERE status <> 'failed'`):* lets a late "fail" refund a
+  message that was already sent.
+- *UUIDv4 or BIGSERIAL ids:* v4 scatters primary-key inserts across the B-tree.
+  BIGSERIAL needs a database round trip before the id is known, and leaks volume.
+
 ## Consequences
 
 - One short transaction per message: about six statements, a single row lock on

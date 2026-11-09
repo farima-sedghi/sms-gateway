@@ -82,6 +82,19 @@ the simpler design wins.
   index lookup does it. This is the number to alert on: it grows when the relay
   falls behind or Kafka is down.
 
+## Alternatives considered
+- *One loop for all topics, express first:* a big normal batch waiting on Kafka
+  still delays the next express batch. Separate lanes share nothing.
+- *Claim-then-publish with a lease (no transaction held during the produce):*
+  needs lease columns, expiry and recovery. With SKIP LOCKED, held locks block no
+  one, so it buys nothing at our latencies (see "Holding the transaction" above).
+- *Delete rows on publish instead of marking + hourly cleanup:* fewer writes, but
+  no short history for debugging, and it is the same churn in a different place.
+- *CDC (Debezium / logical decoding):* push-based and no UPDATE/DELETE churn, but
+  another system to run. It is the documented future path.
+- *Keeping the old index `(id) WHERE published_at IS NULL`:* the express query
+  would scan the whole normal backlog (see "Lanes").
+
 ## Consequences
 
 - Express latency from the outbox to Kafka is about its idle interval plus one

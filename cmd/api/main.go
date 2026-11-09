@@ -14,7 +14,6 @@ import (
 
 	"github.com/farima-sedghi/sms-gateway/internal/platform/config"
 	"github.com/farima-sedghi/sms-gateway/internal/platform/httpserver"
-	"github.com/farima-sedghi/sms-gateway/internal/platform/kafka"
 	"github.com/farima-sedghi/sms-gateway/internal/platform/logging"
 	"github.com/farima-sedghi/sms-gateway/internal/platform/postgres"
 	"github.com/farima-sedghi/sms-gateway/internal/ratelimit"
@@ -26,7 +25,6 @@ import (
 type appConfig struct {
 	HTTPAddr        string
 	DatabaseURL     string
-	KafkaBrokers    []string
 	LogLevel        slog.Level
 	ShutdownTimeout time.Duration
 	SMSPrice        int64         // minor units per message
@@ -45,7 +43,6 @@ func loadConfig() (appConfig, error) {
 	cfg := appConfig{
 		HTTPAddr:        r.String("HTTP_ADDR", ":8080"),
 		DatabaseURL:     r.Required("DATABASE_URL"),
-		KafkaBrokers:    r.RequiredList("KAFKA_BROKERS"),
 		LogLevel:        r.LogLevel("LOG_LEVEL", slog.LevelInfo),
 		ShutdownTimeout: r.Duration("SHUTDOWN_TIMEOUT", 15*time.Second),
 		SMSPrice:        r.Int64("SMS_PRICE", 0),
@@ -102,23 +99,17 @@ func run(ctx context.Context) error {
 	}
 	defer db.Close()
 
-	kc, err := kafka.NewClient(ctx, cfg.KafkaBrokers)
-	if err != nil {
-		return err
+	// Per-customer plans (customer_limits) are cached in memory and
+	// refreshed every 10s, so no request queries them. Customers without a
+	// plan get the env defaults. Every limit is global per customer; each
+	// instance enforces its share (global / API_INSTANCES).
+	plans := ratelimit.NewPlanCache(db, log)
+	if err := plans.Refresh(ctx); err != nil {
+		return fmt.Errorf("load rate limit plans: %w", err)
 	}
-	defer kc.Close()
-
-	// Per-instance share of the global per-customer limits. The burst is
-	// divided too, but never below 1, or nobody could ever send.
-	perInstance := func(l ratelimit.Limit) ratelimit.Limit {
-		n := cfg.APIInstances
-		return ratelimit.Limit{Rate: l.Rate / float64(n), Burst: max(l.Burst/n, 1)}
-	}
+	go plans.Run(ctx, 10*time.Second)
 	limiter := ratelimit.NewMemory(ratelimit.Config{
-		Classes: map[string]ratelimit.Limit{
-			string(sms.PriorityNormal):  perInstance(cfg.RateNormal),
-			string(sms.PriorityExpress): perInstance(cfg.RateExpress),
-		},
+		Limits:  plans.LimitFunc(ratelimit.Defaults{Normal: cfg.RateNormal, Express: cfg.RateExpress}, cfg.APIInstances),
 		IdleTTL: cfg.RateIdleTTL,
 	}, log)
 	go limiter.Run(ctx, time.Minute) // evicts idle buckets; stops on shutdown
@@ -130,10 +121,14 @@ func run(ctx context.Context) error {
 	wallet.NewHandler(walletSvc, log).Register(mux)
 	sms.NewHandler(smsSvc, log).Register(mux)
 	report.NewHandler(report.NewService(db), log).Register(mux)
+	ratelimit.NewHandler(db, plans, log).Register(mux)
 	mux.HandleFunc("GET /healthz", httpserver.Healthz)
+	// Readiness checks Postgres only. The API never talks to Kafka: accepted
+	// messages go to the outbox table, so during a Kafka outage the API keeps
+	// accepting and must stay in the load balancer. Kafka health is the
+	// relay's and dispatcher's concern (their lag shows it).
 	mux.Handle("GET /readyz", httpserver.Readyz(map[string]httpserver.Check{
 		"postgres": db.Ping,
-		"kafka":    func(ctx context.Context) error { return kafka.Ping(ctx, kc) },
 	}))
 
 	handler := httpserver.Chain(mux,

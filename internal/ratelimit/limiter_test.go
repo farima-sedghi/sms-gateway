@@ -29,10 +29,10 @@ func (c *fakeClock) Advance(d time.Duration) {
 
 func newLimiter(clock *fakeClock) *Memory {
 	return NewMemory(Config{
-		Classes: map[string]Limit{
+		Limits: Static(map[string]Limit{
 			"normal":  {Rate: 10, Burst: 5},
 			"express": {Rate: 2, Burst: 2},
-		},
+		}),
 		IdleTTL: time.Minute,
 		Now:     clock.Now,
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -125,15 +125,23 @@ func TestEvictRemovesOnlyIdleBuckets(t *testing.T) {
 	}
 }
 
-// IdleTTL shorter than the refill time would let eviction reset a bucket
-// that was still refilling; NewMemory raises it.
-func TestIdleTTLIsAtLeastRefillTime(t *testing.T) {
+// A bucket idle for less than its refill time is still refilling; evicting
+// it would hand the customer a fresh full bucket early. It must be kept.
+func TestEvictKeepsBucketsThatAreStillRefilling(t *testing.T) {
+	clock := &fakeClock{t: time.Unix(1_700_000_000, 0)}
 	l := NewMemory(Config{
-		Classes: map[string]Limit{"slow": {Rate: 1, Burst: 600}}, // 10 minutes to refill
+		Limits:  Static(map[string]Limit{"slow": {Rate: 1, Burst: 600}}), // 10 minutes to refill
 		IdleTTL: time.Minute,
+		Now:     clock.Now,
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if l.cfg.IdleTTL < 10*time.Minute {
-		t.Errorf("IdleTTL = %v, want >= 10m", l.cfg.IdleTTL)
+	l.Allow(1, "slow")
+	clock.Advance(5 * time.Minute) // past IdleTTL, not past the refill time
+	if n := l.Evict(); n != 0 {
+		t.Errorf("evicted a bucket still refilling")
+	}
+	clock.Advance(6 * time.Minute)
+	if n := l.Evict(); n != 1 {
+		t.Errorf("full idle bucket not evicted")
 	}
 }
 
