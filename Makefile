@@ -13,10 +13,12 @@ build: ## Build all binaries into ./bin
 	$(GO) build -o bin/ ./cmd/...
 
 # DB tests create (and drop) their own database on this server; needs `make up` first.
+# Kafka tests create (and delete) their own topics on this broker.
 TEST_DATABASE_URL ?= postgres://sms:sms@localhost:5432/sms?sslmode=disable
+TEST_KAFKA_BROKERS ?= localhost:29092
 
-test: ## Run unit + Postgres tests (needs the compose postgres running)
-	TEST_DATABASE_URL='$(TEST_DATABASE_URL)' $(GO) test -race -count=1 ./...
+test: ## Run unit + Postgres/Kafka tests (needs `make up` first)
+	TEST_DATABASE_URL='$(TEST_DATABASE_URL)' TEST_KAFKA_BROKERS='$(TEST_KAFKA_BROKERS)' $(GO) test -race -count=1 ./...
 
 lint: ## go vet + gofmt check
 	$(GO) vet ./...

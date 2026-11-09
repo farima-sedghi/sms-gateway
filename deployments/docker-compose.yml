@@ -129,7 +129,14 @@ services:
       context: ..
       args: { CMD: outbox-relay, GOPROXY: "${GOPROXY:-https://proxy.golang.org,direct}" }
     image: sms-gateway/outbox-relay:dev
-    environment: *app-env
+    environment:
+      <<: *app-env
+      OUTBOX_BATCH_SIZE: ${OUTBOX_BATCH_SIZE:-500}
+      OUTBOX_EXPRESS_IDLE: ${OUTBOX_EXPRESS_IDLE:-20ms}
+      OUTBOX_NORMAL_IDLE: ${OUTBOX_NORMAL_IDLE:-100ms}
+      OUTBOX_RETENTION: ${OUTBOX_RETENTION:-1h}
+      OUTBOX_CLEANUP_INTERVAL: ${OUTBOX_CLEANUP_INTERVAL:-1m}
+      OUTBOX_LAG_INTERVAL: ${OUTBOX_LAG_INTERVAL:-10s}
     depends_on: *app-depends
     restart: unless-stopped
 

@@ -78,6 +78,11 @@ func (r *Reader) Duration(key string, def time.Duration) time.Duration {
 	return d
 }
 
+// Int parses a base-10 int, e.g. a batch size.
+func (r *Reader) Int(key string, def int) int {
+	return int(r.Int64(key, int64(def)))
+}
+
 // Int64 parses a base-10 integer, e.g. a price in minor units.
 func (r *Reader) Int64(key string, def int64) int64 {
 	v, ok := r.get(key)
